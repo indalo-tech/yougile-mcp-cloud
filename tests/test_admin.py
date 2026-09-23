@@ -70,6 +70,7 @@ async def test_company_settings_reach_mcp_sessions(server, settings, http):
             "confirm": ["p1", "p-foreign"],
             "deny": ["task_delete", "bogus"],
             "workflows": "проект / доска: очередь -> готово",
+            "done": ["готово", "Нет такой"],
         },
         headers=origin(settings),
     )
@@ -77,15 +78,18 @@ async def test_company_settings_reach_mcp_sessions(server, settings, http):
     stored = (await server.db.get_company("c-main")).settings
     assert stored["workflows"] == {"Проект / Доска": ["Очередь", "Готово"]}
     assert (stored["deny"], stored["confirm_projects"]) == (["tasks.delete"], ["p1"])
+    assert stored["done_columns"] == ["Готово"], "known titles only, as YouGile spells them"
 
     page = await http.get("/admin/settings?done=settings")
     assert "Настройки сохранены" in page.text and "Проект / Доска: Очередь → Готово" in page.text
+    assert 'name="done" value="Готово" checked' in page.text
 
     server.tenancy._cache.clear()
     async with mcp(settings, bob["access_token"]) as c:
         overview = (await c.call_tool("yougile_overview", {})).data
         assert (overview["company_rules"], overview["timezone"]) == ("Пиши кратко", "Asia/Yerevan")
         assert overview["projects"][0]["boards"][0]["workflow"] == ["Очередь", "Готово"]
+        assert overview["done_columns"] == ["Готово"]
         assert "role=reader" in overview["permissions"]
         result = await c.call_tool(
             "yougile_tasks",

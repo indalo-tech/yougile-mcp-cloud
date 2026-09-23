@@ -81,6 +81,21 @@ def _project_ids(refs: Iterable[str], projects: list[tuple[str, str]]) -> set[st
     return {ref if ref in ids else by_title.get(_norm(ref), ref) for ref in refs}
 
 
+def _column_titles(columns: Iterable[dict]) -> list[str]:
+    """Distinct column titles of the company (case-insensitively), sorted."""
+    titles: dict[str, str] = {}
+    for c in columns:
+        if c.get("title") and not c.get("deleted"):
+            titles.setdefault(_norm(c["title"]), c["title"])
+    return sorted(titles.values(), key=str.casefold)
+
+
+def _pick_titles(refs: Iterable[str], titles: list[str]) -> set[str]:
+    """The known titles among ``refs``, whatever their case or spacing."""
+    wanted = {_norm(ref) for ref in refs}
+    return {title for title in titles if _norm(title) in wanted}
+
+
 def _choice(value: Any, allowed: Iterable[str], default: str) -> str:
     return value if isinstance(value, str) and value in allowed else default
 
@@ -447,7 +462,9 @@ class AdminPages:
         return await self._guarded(request, self._settings_form)
 
     async def _settings_form(self, request: Request, ctx: Ctx) -> Response:
-        projects = _projects(await fetch_all(ctx.client, "/projects"))
+        structure = await Directory(ctx.client).structure()
+        projects = _projects(structure.projects.values())
+        columns = _column_titles(structure.columns.values())
         s = ctx.session.company.settings
         instructions = s.get("instructions", "")
         values = ui.SettingsForm(
@@ -459,9 +476,10 @@ class AdminPages:
             confirm=_project_ids(s.get("confirm_projects", []), projects),
             deny=ctx.frame.company_denied,
             workflows=format_workflows(s.get("workflows", {})),
+            done=_pick_titles(s.get("done_columns", []), columns),
         )
         done = request.query_params.get("done")
-        return self._html(ui.settings_page(ctx.frame, values, projects, done=done))
+        return self._html(ui.settings_page(ctx.frame, values, projects, columns, done=done))
 
     async def save_settings(self, request: Request) -> Response:
         return await self._guarded(request, self._save_settings, post=True)
@@ -470,6 +488,7 @@ class AdminPages:
         form = ctx.form
         structure = await Directory(ctx.client).structure()
         projects = _projects(structure.projects.values())
+        columns = _column_titles(structure.columns.values())
         values = ui.SettingsForm(
             timezone=str(form.get("timezone", "")).strip() or DEFAULT_TIMEZONE,
             default_role=str(form.get("default_role", "")),
@@ -477,6 +496,7 @@ class AdminPages:
             confirm={str(p) for p in form.getlist("confirm")} & {pid for pid, _ in projects},
             deny={str(k) for k in form.getlist("deny")},
             workflows=str(form.get("workflows", "")).replace("\r\n", "\n").strip(),
+            done=_pick_titles([str(v) for v in form.getlist("done")], columns),
         )
         errors: list[str] = []
         if values.timezone not in ui.timezones():
@@ -495,17 +515,19 @@ class AdminPages:
             "confirm_projects": sorted(values.confirm),
             "deny": deny_list(values.deny),
             "workflows": workflows,
+            "done_columns": [title for title in columns if title in values.done],
         }
         if not errors:
             try:  # the same check the MCP side runs: a bad value must never reach it
+                keys = ("timezone", "instructions", "workflows", "deny", "done_columns")
                 WorkspaceConfig.from_dict(
-                    {k: new[k] for k in ("timezone", "instructions", "workflows", "deny")}
+                    {k: new[k] for k in keys}
                     | {"role": new["default_role"], "confirm_projects": new["confirm_projects"]}
                 )
             except ConfigError as exc:
                 errors.append(str(exc))
         if errors:
-            page = ui.settings_page(ctx.frame, values, projects, errors=errors)
+            page = ui.settings_page(ctx.frame, values, projects, columns, errors=errors)
             return self._html(page, 400)
         company = ctx.session.company
         await self.db.save_company_settings(company.id, new)
@@ -517,6 +539,7 @@ class AdminPages:
             deny=new["deny"],
             confirm_projects=new["confirm_projects"],
             workflows=list(workflows),
+            done_columns=new["done_columns"],
         )
         return _redirect("/admin/settings?done=settings")
 

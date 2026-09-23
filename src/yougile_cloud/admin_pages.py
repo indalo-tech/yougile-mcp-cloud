@@ -64,6 +64,7 @@ class SettingsForm:
     confirm: set[str] = field(default_factory=set)
     deny: set[str] = field(default_factory=set)
     workflows: str = ""
+    done: set[str] = field(default_factory=set)  # column titles that mean "done"
 
 
 @dataclass
@@ -228,10 +229,18 @@ def users_page(
 # ---------- company settings ----------
 
 
+def _done_boxes(columns: list[str], checked: set[str]) -> str:
+    if not columns:
+        return '<p class="muted">В компании пока нет колонок.</p>'
+    boxes = "".join(_checkbox("done", title, title, title in checked) for title in columns)
+    return f'<div class="list">{boxes}</div>'
+
+
 def settings_page(
     frame: Frame,
     values: SettingsForm,
     projects: list[tuple[str, str]],
+    columns: list[str],
     *,
     errors: list[str] | None = None,
     done: str | None = None,
@@ -264,6 +273,12 @@ def settings_page(
         '<p class="hint">YouGile не отдаёт настройки Workflow по API. Одна доска — одна строка: '
         "«Проект / Доска: Колонка → Колонка → …». Перенося задачу, ассистент пройдёт все "
         "промежуточные колонки; первая колонка — место для новых задач.</p>"
+        "<fieldset><legend>Колонки «готово»</legend>"
+        + _done_boxes(columns, values.done)
+        + '<p class="hint">Задачи в этих колонках ассистент считает сделанными, даже если их '
+        "не отметили выполненными. Перенося задачу в такую колонку, он сам отмечает её "
+        "выполненной — YouGile запоминает дату, и задача попадает в стендап и отчёты за период. "
+        "У задач, перенесённых вручную без отметки, даты нет.</p></fieldset>"
         '<label for="timezone">Часовой пояс</label>'
         f'<input type="text" id="timezone" name="timezone" list="zones" '
         f'value="{e(values.timezone)}" autocomplete="off"><datalist id="zones">{zones}</datalist>'
