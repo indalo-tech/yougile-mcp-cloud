@@ -93,6 +93,8 @@ async def test_company_settings_reach_mcp_sessions(server, settings, http):
             raise_on_error=False,
         )
         assert result.is_error and "reader" in str(result.content)
+        standup = await c.get_prompt("standup")
+        assert "Asia/Yerevan" in standup.messages[0].content.text, "prompts follow company time"
 
     assert "последний запрос" in (await http.get("/admin")).text
 

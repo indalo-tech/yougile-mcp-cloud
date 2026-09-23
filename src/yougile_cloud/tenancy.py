@@ -136,12 +136,13 @@ class Tenancy:
 
 
 class TenantMiddleware(Middleware):
-    """Binds the caller's runtime around each tool call (and nothing else)."""
+    """Binds the caller's runtime around tool calls and prompt rendering (prompts need the
+    company's time zone); listings need no tenant."""
 
     def __init__(self, tenancy: Callable[[], Tenancy]) -> None:
         self.tenancy = tenancy  # resolved per call: the Tenancy is created at startup
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext) -> Any:
+    async def _bound(self, context: MiddlewareContext, call_next: CallNext) -> Any:
         token = get_access_token()
         if token is None or not token.subject:
             raise ToolError("Нет авторизации: подключите YouGile MCP заново.")
@@ -151,3 +152,9 @@ class TenantMiddleware(Middleware):
             return await call_next(context)
         finally:
             runtime.reset(bound)
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext) -> Any:
+        return await self._bound(context, call_next)
+
+    async def on_get_prompt(self, context: MiddlewareContext, call_next: CallNext) -> Any:
+        return await self._bound(context, call_next)
