@@ -10,7 +10,7 @@ from yougile_mcp.directory import Structure
 
 from yougile_cloud.access import access_of
 from yougile_cloud.crypto import Secrets
-from yougile_cloud.db import Company, Database, Rights
+from yougile_cloud.db import Company, Database, Rights, User
 from yougile_cloud.kv import KV, CompanyRateLimiter
 from yougile_cloud.permissions import (
     all_write_actions,
@@ -21,7 +21,7 @@ from yougile_cloud.permissions import (
     restrictions,
 )
 from yougile_cloud.settings import Settings, SettingsError
-from yougile_cloud.tenancy import workspace_config
+from yougile_cloud.tenancy import Tenancy, workspace_config
 
 NOW = datetime(2026, 9, 23, tzinfo=UTC)
 
@@ -74,6 +74,27 @@ def test_workspace_config_merges_company_and_user():
     )
     broken = workspace_config(company(settings={"timezone": "Mars/Base"}), None)
     assert broken.role == "reader", "a bad setting falls back to read-only, never to admin"
+
+
+async def test_runtime_sends_people_to_the_admin_page(settings):
+    secrets = Secrets(settings.encryption_keys, settings.jwt_secret)
+    tenancy = Tenancy(settings, None, KV(None), secrets)  # type: ignore[arg-type]
+    user = User(
+        id=1,
+        company_id="c",
+        yougile_user_id="u",
+        email="",
+        name="",
+        is_admin=False,
+        api_key_enc=secrets.encrypt("key"),
+        updated_at=NOW,
+    )
+    rt = tenancy._build(user, company(), None)
+    try:
+        assert f"{settings.public_url}/admin" in rt.settings_hint
+        assert rt.allow_local_files is False
+    finally:
+        await rt.client.aclose()
 
 
 def test_restrictions_cover_every_write():

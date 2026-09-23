@@ -88,7 +88,13 @@ class Tenancy:
         )
         config = workspace_config(company, rights)
         return runtime.Runtime(
-            client, config, Policy.from_config(config), Directory(client), allow_local_files=False
+            client,
+            config,
+            Policy.from_config(config),
+            Directory(client),
+            allow_local_files=False,
+            settings_hint=f"the company admin page {self.settings.public_url}/admin "
+            "(company admins only; Workflow chains are under Настройки)",
         )
 
     async def runtime_for(self, user_id: int) -> runtime.Runtime:

@@ -102,6 +102,9 @@ def cmd_company(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(stream=sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO").upper())
+    # yougile_mcp.client already logs each YouGile call (method, path, status, time); httpx2
+    # would repeat it with the full URL, query strings included.
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(prog="yougile-cloud")
     parser.add_argument("--version", action="version", version=f"yougile-cloud {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
