@@ -106,6 +106,7 @@ jobs:
         run: |
           base=https://yougile.indalo.ru
           curl -fsS --retry 5 --retry-delay 3 --retry-all-errors "$base/healthz"
+          curl -fsS "$base/" | grep -qF "$base/mcp"
           curl -fsS "$base/.well-known/oauth-authorization-server" | grep -q "\"issuer\":\"$base/\""
           test "$(curl -s -o /dev/null -w '%{http_code}' "$base/mcp")" = 401
           curl -fsS "$base/admin/login" | grep -q 'Управление YouGile MCP'

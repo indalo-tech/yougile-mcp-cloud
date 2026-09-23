@@ -1,4 +1,4 @@
-"""Public HTML routes: the YouGile sign-in step of the OAuth flow, and a health check."""
+"""Public HTML routes: the home page, the YouGile sign-in step of the OAuth flow, health."""
 
 from __future__ import annotations
 
@@ -27,7 +27,9 @@ SECURITY_HEADERS = {
     "frame-ancestors 'none'; base-uri 'none'",
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    # Not "no-referrer": with it browsers send "Origin: null" on form posts, and the Origin
+    # check refuses our own forms. same-origin still sends nothing to other sites.
+    "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
 LEAD = "Подключение YouGile к AI-ассистенту. Войдите своей учётной записью YouGile."
@@ -80,6 +82,9 @@ class SignInPages:
 
     async def _request(self, flow: str) -> dict | None:
         return await self.kv.get_json(self.kv.key("authreq", flow)) if flow else None
+
+    async def home(self, _request: Request) -> Response:
+        return html(pages.home_page(self.settings.mcp_url))
 
     async def show(self, request: Request) -> Response:
         flow = request.query_params.get("flow", "")

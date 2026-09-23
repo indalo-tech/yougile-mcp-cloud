@@ -50,6 +50,8 @@ button.danger{background:var(--error-bg);color:var(--error)}
 .actions{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px}
 .actions form{margin:0}
 textarea.prose{font-family:inherit;font-size:15px}p.foot{text-align:center;margin-top:20px}
+code.url{display:block;padding:10px 12px;border:1px solid var(--line);border-radius:8px;
+background:var(--bg);font-size:15px;user-select:all;overflow-wrap:anywhere}ol{padding-left:20px}
 @media (max-width:640px){table,thead,tbody,tr,td,th{display:block}thead{display:none}
 td{border:0;padding:4px 0}tr{border-bottom:1px solid var(--line);padding:8px 0}
 td[data-label]::before{content:attr(data-label) ": ";color:var(--muted)}}
@@ -120,6 +122,22 @@ def company_page(
         "Выбор компании",
         f"<h1>Выберите компанию</h1><p class=lead>{e(lead)}</p>"
         f'<form method="post" action="{e(action)}">{fields}{buttons}</form>',
+    )
+
+
+def home_page(mcp_url: str) -> str:
+    return page(
+        "YouGile MCP",
+        "<h1>YouGile MCP</h1><p class=lead>YouGile в AI-ассистенте — Claude и других клиентах с "
+        "поддержкой MCP. Без установки: ассистент видит проекты, доски и задачи и работает с "
+        "ними с вашими правами в YouGile.</p>"
+        "<label>Адрес для подключения</label>"
+        f'<p><code class="url">{e(mcp_url)}</code></p>'
+        "<ol><li>В AI-клиенте добавьте удалённый MCP-сервер (коннектор) с этим адресом.</li>"
+        "<li>Клиент откроет страницу входа — войдите логином и паролем YouGile.</li>"
+        "<li>Если вы в нескольких компаниях, выберите одну.</li></ol>"
+        '<p class="note">Администраторам компании: права сотрудников и правила для ассистента — '
+        'на <a href="/admin">странице управления</a>.</p>',
     )
 
 

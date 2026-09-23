@@ -43,6 +43,7 @@ async def test_admin_sign_in_and_employees(server, settings, http):
     assert "u-anna@example.com" in home.text and "u-bob@example.com" in home.text
     assert "<img" not in home.text and "&lt;img" in home.text, "names from YouGile are escaped"
     assert "form-action 'self'" in home.headers["content-security-policy"]
+    assert home.headers["referrer-policy"] == "same-origin", "else browsers post Origin: null"
 
 
 async def test_only_admins_get_in(server, settings, http, fake):

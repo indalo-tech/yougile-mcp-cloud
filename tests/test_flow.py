@@ -83,6 +83,13 @@ async def test_refresh_rotates_and_old_token_dies(server, settings, http):
     assert replay.json()["error"] == "invalid_grant"
 
 
+async def test_home_page_gives_the_address(server, settings, http):
+    page = await http.get("/")
+    assert page.status_code == 200 and settings.mcp_url in page.text
+    assert 'href="/admin"' in page.text
+    assert "default-src 'none'" in page.headers["content-security-policy"]
+
+
 async def test_mcp_needs_a_valid_token(server, settings, http):
     resp = await http.post(
         "/mcp",
@@ -101,6 +108,8 @@ async def test_signin_page_is_safe(server, settings, http):
     page = await http.get(signin_path)
     assert "<script>" not in page.text, "client_name must never be rendered raw"
     assert "default-src 'none'" in page.headers["content-security-policy"]
+    # Browsers post forms from a no-referrer page with "Origin: null", which we refuse.
+    assert page.headers["referrer-policy"] == "same-origin"
 
     flow = signin_path.split("flow=")[1]
     no_csrf = await http.post(

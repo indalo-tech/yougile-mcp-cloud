@@ -73,6 +73,7 @@ def create_server(settings: Settings, *, transport: Any = None) -> tuple[FastMCP
         middleware=[TenantMiddleware(lambda: services.tenancy)],
         lifespan=lifespan,
     )
+    mcp.custom_route("/", methods=["GET"])(services.pages.home)
     mcp.custom_route("/signin", methods=["GET"])(services.pages.show)
     mcp.custom_route("/signin", methods=["POST"])(services.pages.submit)
     mcp.custom_route("/signin/company", methods=["POST"])(services.pages.choose_company)
