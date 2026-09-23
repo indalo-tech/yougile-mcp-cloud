@@ -46,10 +46,6 @@ class Settings:
     def mcp_url(self) -> str:
         return f"{self.public_url}/mcp"
 
-    @property
-    def admin_audience(self) -> str:
-        return f"{self.public_url}/admin"
-
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         env = os.environ if env is None else env

@@ -12,6 +12,7 @@ import re
 import secrets as pysecrets
 import socket
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx2
 import pytest
@@ -54,17 +55,30 @@ class FakeYouGile:
         self.accounts = {
             "anna@example.com": {
                 "password": "right",
-                "memberships": {
-                    "c-main": ("u-anna", True),
-                    "c-free": ("u-anna-free", False),
-                },
+                "memberships": {"c-main": "u-anna", "c-free": "u-anna-free", "c-two": "u-anna-two"},
             },
-            "solo@example.com": {"password": "pw", "memberships": {"c-solo": ("u-solo", False)}},
+            "bob@example.com": {"password": "pw", "memberships": {"c-main": "u-bob"}},
+            "solo@example.com": {"password": "pw", "memberships": {"c-solo": "u-solo"}},
         }
-        self.company_names = {"c-main": "Main Co", "c-free": "Own Co", "c-solo": "Solo Co"}
+        self.company_names = {
+            "c-main": "Main Co",
+            "c-free": "Own Co",
+            "c-solo": "Solo Co",
+            "c-two": "Two Co",
+        }
+        self.admins = {"u-anna": True, "u-anna-two": True}  # tests may demote someone
+        self.names = {"u-bob": "Bob <img src=x onerror=alert(1)>"}
         self.keys: dict[str, tuple[str, str]] = {}  # key -> (company, user)
         self.deleted: list[str] = []
         self.calls: list[tuple[str, str]] = []
+
+    def _user(self, user: str) -> dict:
+        return {
+            "id": user,
+            "email": f"{user}@example.com",
+            "realName": self.names.get(user, user),
+            "isAdmin": self.admins.get(user, False),
+        }
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path.removeprefix("/api-v2")
@@ -75,15 +89,15 @@ class FakeYouGile:
             if not account or account["password"] != body.get("password"):
                 return httpx2.Response(401, json={"error": "Unauthorized"})
             content = [
-                {"id": cid, "name": self.company_names[cid], "isAdmin": admin}
-                for cid, (_, admin) in account["memberships"].items()
+                {"id": cid, "name": self.company_names[cid], "isAdmin": self.admins.get(uid, False)}
+                for cid, uid in account["memberships"].items()
             ]
             return httpx2.Response(200, json={"paging": {"next": False}, "content": content})
         if path == "/auth/keys" and request.method == "POST":
             account = self.accounts.get(body.get("login", ""))
             if not account or account["password"] != body.get("password"):
                 return httpx2.Response(401, json={"error": "Unauthorized"})
-            user_id, _ = account["memberships"][body["companyId"]]
+            user_id = account["memberships"][body["companyId"]]
             key = pysecrets.token_hex(16)
             self.keys[key] = (body["companyId"], user_id)
             return httpx2.Response(201, json={"key": key})
@@ -97,21 +111,21 @@ class FakeYouGile:
             return httpx2.Response(401, json={"error": "Unauthorized"})
         company, user = self.keys[auth]
         if path == "/users/me":
-            admin = user == "u-anna"
-            return httpx2.Response(
-                200,
-                json={
-                    "id": user,
-                    "email": f"{user}@example.com",
-                    "realName": user,
-                    "isAdmin": admin,
-                },
-            )
+            return httpx2.Response(200, json=self._user(user))
+        members = [
+            uid
+            for account in self.accounts.values()
+            for cid, uid in account["memberships"].items()
+            if cid == company
+        ]
         lists = {
             "/projects": [{"id": "p1", "title": "Проект"}],
             "/boards": [{"id": "b1", "title": "Доска", "projectId": "p1"}],
-            "/columns": [{"id": "k1", "title": "Очередь", "boardId": "b1"}],
-            "/users": [{"id": user, "realName": user, "email": f"{user}@example.com"}],
+            "/columns": [
+                {"id": "k1", "title": "Очередь", "boardId": "b1"},
+                {"id": "k2", "title": "Готово", "boardId": "b1"},
+            ],
+            "/users": [self._user(uid) for uid in members],
         }
         if path in lists:
             return httpx2.Response(200, json={"paging": {"next": False}, "content": lists[path]})
@@ -279,3 +293,47 @@ async def exchange(
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+async def connect(
+    http: httpx2.AsyncClient,
+    settings: Settings,
+    *,
+    login: str,
+    password: str,
+    company: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """The whole OAuth dance of an AI client; returns its client_id and tokens."""
+    client_id = await register_client(http)
+    signin_path, verifier = await start_flow(http, settings, client_id)
+    resp = await sign_in(
+        http, settings, signin_path, login=login, password=password, company=company
+    )
+    assert resp.status_code == 302, resp.text
+    code = parse_qs(urlparse(resp.headers["location"]).query)["code"][0]
+    return client_id, await exchange(http, client_id, code, verifier)
+
+
+async def admin_login(
+    http: httpx2.AsyncClient,
+    settings: Settings,
+    *,
+    login: str = "anna@example.com",
+    password: str = "right",
+    company: str | None = "c-main",
+) -> httpx2.Response:
+    page = await http.get("/admin/login")
+    assert page.status_code == 200, page.text
+    origin = {"Origin": settings.public_url}
+    resp = await http.post(
+        "/admin/login",
+        data={"csrf": field(page.text, "csrf"), "login": login, "password": password},
+        headers=origin,
+    )
+    if company is None or resp.status_code != 200 or "Выберите компанию" not in resp.text:
+        return resp
+    return await http.post(
+        "/admin/login/company",
+        data={"csrf": field(resp.text, "csrf"), "company": company},
+        headers=origin,
+    )

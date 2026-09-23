@@ -1,4 +1,4 @@
-"""Assembly: the core MCP server + OAuth + per-request tenancy + sign-in pages."""
+"""Assembly: the core MCP server + OAuth + per-request tenancy + sign-in and admin pages."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from fastmcp import FastMCP
 from starlette.applications import Starlette
 from yougile_mcp.server import build_server
 
+from .admin import AdminPages
 from .crypto import Secrets
 from .db import Database
 from .kv import KV
@@ -30,6 +31,7 @@ class Services:
         self.secrets = Secrets(settings.encryption_keys, settings.jwt_secret)
         self.provider = CloudOAuthProvider(settings, self.secrets)
         self.pages = SignInPages(settings, self.secrets, self.provider)
+        self.admin = AdminPages(settings, self.secrets)
         self.db: Database | None = None
         self.kv: KV | None = None
         self.tenancy: Tenancy | None = None
@@ -42,7 +44,9 @@ class Services:
         auth = YouGileAuth(self.settings.yougile_base_url, self.transport)
         self.tenancy = Tenancy(self.settings, self.db, self.kv, self.secrets, self.transport)
         self.provider.attach(self.db, self.kv)
-        self.pages.attach(SignIn(self.settings, self.db, self.kv, self.secrets, auth), self.kv)
+        signin = SignIn(self.settings, self.db, self.kv, self.secrets, auth)
+        self.pages.attach(signin, self.kv)
+        self.admin.attach(self.db, self.kv, signin, auth, self.tenancy, self.transport)
 
     async def stop(self) -> None:
         if self.tenancy:
@@ -72,6 +76,8 @@ def create_server(settings: Settings, *, transport: Any = None) -> tuple[FastMCP
     mcp.custom_route("/signin", methods=["GET"])(services.pages.show)
     mcp.custom_route("/signin", methods=["POST"])(services.pages.submit)
     mcp.custom_route("/signin/company", methods=["POST"])(services.pages.choose_company)
+    for path, method, endpoint in services.admin.routes():
+        mcp.custom_route(path, methods=[method])(endpoint)
     mcp.custom_route("/healthz", methods=["GET"])(healthz)
     return mcp, services
 

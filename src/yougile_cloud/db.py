@@ -35,6 +35,7 @@ class User:
     is_admin: bool
     api_key_enc: bytes
     updated_at: datetime
+    last_seen_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ def _user(row: dict) -> User:
         is_admin=row["is_admin"],
         api_key_enc=bytes(row["api_key_enc"]),
         updated_at=row["updated_at"],
+        last_seen_at=row["last_seen_at"],
     )
 
 
@@ -276,6 +278,13 @@ class Database:
                 None if projects is None else Jsonb(projects),
                 Jsonb(deny),
             ),
+        )
+
+    async def delete_rights(self, company_id: str, yougile_user_id: str) -> None:
+        """Back to the company defaults."""
+        await self._exec(
+            "DELETE FROM user_rights WHERE company_id = %s AND yougile_user_id = %s",
+            (company_id, yougile_user_id),
         )
 
     # ---------- OAuth clients and refresh tokens ----------

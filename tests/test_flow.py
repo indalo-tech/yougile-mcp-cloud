@@ -52,7 +52,7 @@ async def test_full_flow_with_company_choice(server, settings, http, fake):
         tools = {t.name for t in await c.list_tools()}
         assert {"yougile_overview", "yougile_tasks"} <= tools
         overview = (await c.call_tool("yougile_overview", {})).data
-        assert overview["projects"][0]["boards"][0]["columns"] == ["Очередь"]
+        assert overview["projects"][0]["boards"][0]["columns"] == ["Очередь", "Готово"]
         # hosted servers must not read local files
         result = await c.call_tool(
             "yougile_files",

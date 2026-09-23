@@ -6,11 +6,20 @@ import pytest
 from conftest import DB_URL, VALKEY_URL
 from cryptography.fernet import Fernet
 from yougile_mcp.client import YouGileError
+from yougile_mcp.directory import Structure
 
 from yougile_cloud.access import access_of
 from yougile_cloud.crypto import Secrets
 from yougile_cloud.db import Company, Database, Rights
 from yougile_cloud.kv import KV, CompanyRateLimiter
+from yougile_cloud.permissions import (
+    all_write_actions,
+    denied_keys,
+    deny_list,
+    format_workflows,
+    parse_workflows,
+    restrictions,
+)
 from yougile_cloud.settings import Settings, SettingsError
 from yougile_cloud.tenancy import workspace_config
 
@@ -65,6 +74,38 @@ def test_workspace_config_merges_company_and_user():
     )
     broken = workspace_config(company(settings={"timezone": "Mars/Base"}), None)
     assert broken.role == "reader", "a bad setting falls back to read-only, never to admin"
+
+
+def test_restrictions_cover_every_write():
+    keys = [r.key for r in restrictions()]
+    assert len(keys) == len(set(keys))
+    assert {a for r in restrictions() for a in r.actions} == all_write_actions(), (
+        "every write the core can do must be switchable off on the admin page"
+    )
+    assert denied_keys(["tasks.delete"]) == {"task_delete"}
+    masked = denied_keys(["yougile_users.*"])
+    assert "people" in masked and "task_delete" not in masked
+    assert deny_list(["task_delete", "no-such-key"]) == ["tasks.delete"]
+
+
+def test_workflows_are_checked_against_boards():
+    s = Structure(
+        projects={"p": {"id": "p", "title": "Клиенты"}},
+        boards={"b": {"id": "b", "title": "Сайт", "projectId": "p"}},
+        columns={
+            "k1": {"id": "k1", "title": "Очередь", "boardId": "b"},
+            "k2": {"id": "k2", "title": "В работе", "boardId": "b"},
+        },
+    )
+    chains, errors = parse_workflows("  клиенты / сайт: очередь → в работе\n\n", s)
+    assert chains == {"Клиенты / Сайт": ["Очередь", "В работе"]} and errors == []
+    assert format_workflows(chains) == "Клиенты / Сайт: Очередь → В работе"
+    _, errors = parse_workflows(
+        "Сайт: Очередь\nЛевая: А -> Б\nСайт: Очередь -> Нет\n"
+        "Сайт: Очередь -> В работе\nСайт: В работе -> Очередь",
+        s,
+    )
+    assert [err.split(":")[0] for err in errors] == ["Строка 1", "Строка 2", "Строка 3", "Строка 5"]
 
 
 def test_settings_validation():

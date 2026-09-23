@@ -32,9 +32,24 @@ color:var(--text);border:1px solid var(--line)}
 table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:8px;
 border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:600}
 .checks label{display:inline-flex;gap:6px;font-weight:400;margin:4px 14px 4px 0}
-nav{display:flex;gap:16px;margin-bottom:16px}nav a{color:var(--accent);text-decoration:none}
+nav{display:flex;gap:16px;margin:4px 0 20px;flex-wrap:wrap}nav a{color:var(--accent);
+text-decoration:none}nav a[aria-current]{color:var(--text);font-weight:600}
+a{color:var(--accent)}h2{font-size:18px;margin:28px 0 8px}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.top button{margin-top:0}.muted{color:var(--muted)}.hint{color:var(--muted);font-size:13px;
+margin:4px 0 0}fieldset{border:1px solid var(--line);border-radius:8px;padding:8px 14px 12px;
+margin:18px 0 0}legend{font-weight:600;padding:0 4px}
+.list label{display:flex;gap:8px;align-items:baseline;font-weight:400;margin:6px 0}
+.pill{display:inline-block;font-size:12px;padding:0 8px;border-radius:999px;margin:2px 6px 0 0;
+border:1px solid var(--line);color:var(--muted)}
+button.secondary{background:var(--bg);color:var(--text);border:1px solid var(--line)}
+button.danger{background:var(--error-bg);color:var(--error)}
+.actions{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.actions form{margin:0}
+textarea.prose{font-family:inherit;font-size:15px}
 @media (max-width:640px){table,thead,tbody,tr,td,th{display:block}thead{display:none}
-td{border:0;padding:4px 0}tr{border-bottom:1px solid var(--line);padding:8px 0}}
+td{border:0;padding:4px 0}tr{border-bottom:1px solid var(--line);padding:8px 0}
+td[data-label]::before{content:attr(data-label) ": ";color:var(--muted)}}
 """
 
 
@@ -82,7 +97,14 @@ def login_page(
     )
 
 
-def company_page(*, action: str, hidden: dict[str, str], companies: list[tuple[str, str]]) -> str:
+def company_page(
+    *,
+    action: str,
+    hidden: dict[str, str],
+    companies: list[tuple[str, str]],
+    lead: str = "Вы состоите в нескольких компаниях YouGile. "
+    "Подключение будет работать с одной из них.",
+) -> str:
     fields = "".join(
         f'<input type="hidden" name="{e(k)}" value="{e(v)}">' for k, v in hidden.items()
     )
@@ -92,12 +114,14 @@ def company_page(*, action: str, hidden: dict[str, str], companies: list[tuple[s
     )
     return page(
         "Выбор компании",
-        "<h1>Выберите компанию</h1><p class=lead>Вы состоите в нескольких компаниях YouGile. "
-        "Подключение будет работать с одной из них.</p>"
+        f"<h1>Выберите компанию</h1><p class=lead>{e(lead)}</p>"
         f'<form method="post" action="{e(action)}">{fields}{buttons}</form>',
     )
 
 
-def message_page(title: str, text: str, *, error: bool = True) -> str:
+def message_page(
+    title: str, text: str, *, error: bool = True, link: tuple[str, str] | None = None
+) -> str:
     kind = "error" if error else "ok"
-    return page(title, f'<h1>{e(title)}</h1><div class="{kind}">{e(text)}</div>')
+    more = f'<p><a href="{e(link[0])}">{e(link[1])}</a></p>' if link else ""
+    return page(title, f'<h1>{e(title)}</h1><div class="{kind}">{e(text)}</div>{more}')

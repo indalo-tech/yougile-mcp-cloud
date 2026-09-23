@@ -101,6 +101,7 @@ class Tenancy:
         access = access_of(company, self.settings.free_company_ids)
         if not access.allowed:
             raise ToolError(access.message())
+        await self.db.touch_user(user.id)  # "last seen" for the admin page, once per RECHECK
         version = (user.updated_at, company.settings_version, rights.updated_at if rights else None)
         async with self._lock:
             entry = self._cache.get(user_id)

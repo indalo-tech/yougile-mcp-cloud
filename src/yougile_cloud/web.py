@@ -33,8 +33,18 @@ SECURITY_HEADERS = {
 LEAD = "Подключение YouGile к AI-ассистенту. Войдите своей учётной записью YouGile."
 
 
-def html(body: str, status: int = 200) -> HTMLResponse:
-    return HTMLResponse(body, status_code=status, headers=SECURITY_HEADERS)
+def html(body: str, status: int = 200, headers: dict[str, str] = SECURITY_HEADERS) -> HTMLResponse:
+    return HTMLResponse(body, status_code=status, headers=headers)
+
+
+def same_origin(request: Request, public_url: str) -> bool:
+    """Form posts must come from our own pages (a missing Origin is allowed, "null" is not)."""
+    origin = request.headers.get("origin")
+    if not origin or origin == "null":
+        return origin is None  # "null" origins (sandboxed frames) are refused
+    ours = urlparse(public_url)
+    theirs = urlparse(origin)
+    return (theirs.scheme, theirs.netloc) == (ours.scheme, ours.netloc)
 
 
 class SignInPages:
@@ -53,12 +63,7 @@ class SignInPages:
         self.signin, self.kv = signin, kv
 
     def _same_origin(self, request: Request) -> bool:
-        origin = request.headers.get("origin")
-        if not origin or origin == "null":
-            return origin is None  # "null" origins (sandboxed frames) are refused
-        ours = urlparse(self.settings.public_url)
-        theirs = urlparse(origin)
-        return (theirs.scheme, theirs.netloc) == (ours.scheme, ours.netloc)
+        return same_origin(request, self.settings.public_url)
 
     def _form(self, flow: str, *, error: str | None = None, login: str = "", status: int = 200):
         return html(
