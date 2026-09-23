@@ -25,12 +25,6 @@ dev = [
     "ruff>=0.16",
 ]
 
-# PyPI's index (a CDN cache) shows a new yougile-mcp release only after a long delay, so a
-# fresh release wheel is pinned by URL; uv.lock holds its hash. Drop this section and run
-# `uv lock` once https://pypi.org/simple/yougile-mcp/ lists the pinned version.
-[tool.uv.sources]
-yougile-mcp = { url = "https://files.pythonhosted.org/packages/3c/40/2f712ea19f0a2711b1067b52d10a385551894917f434e547890e83290669/yougile_mcp-0.5.0-py3-none-any.whl" }
-
 [build-system]
 requires = ["hatchling>=1.32"]
 build-backend = "hatchling.build"
