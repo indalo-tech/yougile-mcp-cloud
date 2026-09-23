@@ -3,6 +3,8 @@ name = "yougile-mcp-cloud"
 version = "0.1.0"
 description = "Hosted YouGile MCP: sign in with YouGile, per-company limits, permissions, trials"
 requires-python = ">=3.14"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{ name = "Indalo" }]
 dependencies = [
     "yougile-mcp>=0.3.0",
@@ -23,9 +25,11 @@ dev = [
     "ruff>=0.16",
 ]
 
-# Until yougile-mcp 0.3.0 is on PyPI the core comes from the sibling checkout.
+# PyPI's index still listed only 0.2.0 for a while after 0.3.0 was uploaded (a stale CDN
+# cache), so the release wheel is pinned by URL; uv.lock holds its hash. Drop this section
+# and run `uv lock` once https://pypi.org/simple/yougile-mcp/ shows 0.3.0.
 [tool.uv.sources]
-yougile-mcp = { path = "../yougile-mcp", editable = true }
+yougile-mcp = { url = "https://files.pythonhosted.org/packages/f3/8f/7482cb2f84df29a9bce2ebcda28f78f70f7e70b9f67cac5b253abc6feb36/yougile_mcp-0.3.0-py3-none-any.whl" }
 
 [build-system]
 requires = ["hatchling>=1.32"]

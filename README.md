@@ -1,8 +1,16 @@
 # YouGile MCP Cloud
 
-Приватный серверный вариант [YouGile MCP](https://github.com/indalo-tech/yougile-mcp): подключение
+[![CI](https://github.com/indalo-tech/yougile-mcp-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/indalo-tech/yougile-mcp-cloud/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+
+Серверный вариант [YouGile MCP](https://github.com/indalo-tech/yougile-mcp): подключение
 по адресу, без установки. Человек входит своим логином YouGile, сервер выпускает ему отдельный
-ключ и работает с его правами. Инструменты, права и лимиты — из публичного ядра `yougile-mcp`.
+ключ и работает с его правами. Инструменты, права и лимиты — из ядра
+[`yougile-mcp`](https://pypi.org/project/yougile-mcp/) с PyPI.
+
+Работающий сервис: `https://yougile.indalo.ru/mcp` — адрес для AI-клиента (Claude, Cursor и
+другие с поддержкой удалённых MCP-серверов и OAuth). Администраторы компаний настраивают права
+на `https://yougile.indalo.ru/admin`.
 
 ## Как устроено
 
@@ -58,6 +66,8 @@ HttpOnly-cookie (`__Host-` на https), в Valkey хранится только 
 
 ## Команды
 
+На сервере — внутри контейнера: `docker compose exec app yougile-cloud companies`.
+
 ```bash
 uv run yougile-cloud serve                     # HTTP-сервер
 uv run yougile-cloud migrate                   # миграции (serve тоже применяет их при старте)
@@ -68,10 +78,25 @@ uv run yougile-cloud company <id> --paid-until 2026-12-31
 uv run yougile-cloud company <id> --block
 ```
 
+## Развёртывание
+
+Образ `ghcr.io/indalo-tech/yougile-mcp-cloud` (публичный) собирает CI на каждый коммит в
+`main`: тег `sha-<коммит>` и `latest`. На сервере — Docker Compose из [`deploy/`](deploy):
+приложение, PostgreSQL 18 и Valkey 9.2 во внутренней сети; наружу только приложение и только
+на `127.0.0.1:8100`, TLS и лимиты по IP — у Caddy хоста. Подробности и команды —
+[deploy/README.md](deploy/README.md).
+
+CI деплоит сам: после тестов и сборки образа заходит на сервер ключом, который там привязан к
+[`deploy/deploy.sh`](deploy/deploy.sh) (`command=` в `authorized_keys`). Скрипт принимает
+только тег образа, разворачивает его и откатывается на прежний, если новые контейнеры не
+поднялись. `compose.yaml` и блок Caddy ставятся на сервер вручную: утёкший ключ CI может
+выбрать сборку образа, но не то, что и с какими правами запускается на хосте. После деплоя CI
+проверяет сервис снаружи — через DNS, TLS и Caddy, как его видит клиент. Секреты деплоя живут
+в окружении `production`, доступном только ветке `main`.
+
 ## Разработка
 
-Ядро подключено соседней папкой `../yougile-mcp` (пока 0.3.0 нет на PyPI). Тестам нужны
-Postgres и Valkey:
+Тестам нужны Postgres и Valkey:
 
 ```bash
 docker run -d --name ygc-test-pg --restart unless-stopped -e POSTGRES_PASSWORD=test \
@@ -87,3 +112,13 @@ uv run pytest
 обновления, пробный период, лимиты попыток, CSRF и экранирование. Страница администратора
 проверяется так же: вход, настройки доходят до MCP-сессии сотрудника, права, отключение,
 снятие прав админа в YouGile, подделка форм.
+
+Чтобы править ядро вместе с облаком, временно добавьте в `pyproject.toml`
+`[tool.uv.sources] yougile-mcp = { path = "../yougile-mcp", editable = true }`. В коммит это
+не попадает: облако всегда собирается с выпущенным ядром с PyPI.
+
+## Лицензия
+
+[GNU AGPL-3.0](LICENSE), © Indalo. Код можно запускать и менять, но если вы даёте доступ к
+изменённой версии по сети, её исходный код нужно открыть пользователям. Ядро
+[`yougile-mcp`](https://github.com/indalo-tech/yougile-mcp) — под MIT.

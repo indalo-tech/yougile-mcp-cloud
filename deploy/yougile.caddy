@@ -1,0 +1,56 @@
+# YouGile MCP Cloud behind the host's Caddy. Installed as /etc/caddy/sites/yougile.caddy;
+# the main Caddyfile pulls it in with `import /etc/caddy/sites/*.caddy`.
+# rate_limit zone names are global across the whole Caddy config: keep the ygc_ prefix.
+
+yougile.indalo.ru {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	# OAuth endpoints for AI clients.
+	@oauth path /authorize /token /register /revoke
+	handle @oauth {
+		rate_limit {
+			zone ygc_oauth {
+				key {client_ip}
+				events 30
+				window 1m
+			}
+		}
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	# Password forms (the app has its own per-login limits on top).
+	@password_forms {
+		method POST
+		path /signin /signin/* /admin/login /admin/login/*
+	}
+	handle @password_forms {
+		rate_limit {
+			zone ygc_login {
+				key {client_ip}
+				events 20
+				window 1m
+			}
+		}
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	handle /mcp* {
+		rate_limit {
+			zone ygc_mcp {
+				key {client_ip}
+				events 300
+				window 1m
+			}
+		}
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	# Sign-in and admin pages, OAuth metadata, health.
+	handle {
+		reverse_proxy 127.0.0.1:8100
+	}
+}

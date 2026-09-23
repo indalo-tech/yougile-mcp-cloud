@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from html import escape
 
+# AGPL: people using the service can always reach the code that runs it.
+SOURCE = "https://github.com/indalo-tech/yougile-mcp-cloud"
+
 CSS = """
 :root{--bg:#f6f7f9;--card:#fff;--text:#1d2330;--muted:#5d6675;--line:#dfe3ea;--accent:#2f6fed;
 --accent-text:#fff;--error-bg:#fdecec;--error:#a4262c;--ok-bg:#e8f5ec;--ok:#1d6b36}
@@ -46,7 +49,7 @@ button.secondary{background:var(--bg);color:var(--text);border:1px solid var(--l
 button.danger{background:var(--error-bg);color:var(--error)}
 .actions{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px}
 .actions form{margin:0}
-textarea.prose{font-family:inherit;font-size:15px}
+textarea.prose{font-family:inherit;font-size:15px}p.foot{text-align:center;margin-top:20px}
 @media (max-width:640px){table,thead,tbody,tr,td,th{display:block}thead{display:none}
 td{border:0;padding:4px 0}tr{border-bottom:1px solid var(--line);padding:8px 0}
 td[data-label]::before{content:attr(data-label) ": ";color:var(--muted)}}
@@ -63,6 +66,7 @@ def page(title: str, body: str, *, wide: bool = False) -> str:
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f'<meta name="robots" content="noindex"><title>{e(title)}</title><style>{CSS}</style>'
         f'</head><body><main class="{"wide" if wide else ""}"><div class="card">{body}</div>'
+        f'<p class="note foot">YouGile MCP · <a href="{SOURCE}">исходный код</a> (AGPL-3.0)</p>'
         "</main></body></html>"
     )
 

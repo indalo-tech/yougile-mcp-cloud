@@ -1,9 +1,18 @@
 name: CI
 
+# Tests on every push and pull request; on main also builds the image and deploys it.
+# The repository is public, and so are these logs: nothing here prints secrets or hosts.
+# Pull requests (forks included) never get the deploy secrets: they live in the
+# `production` environment, which only main may use. Never switch to pull_request_target.
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -24,19 +33,79 @@ jobs:
           --health-cmd "valkey-cli ping" --health-interval 2s --health-retries 30
     steps:
       - uses: actions/checkout@v7
-        with:
-          path: yougile-mcp-cloud
-      # The public core sits next to this repo, as [tool.uv.sources] expects, until
-      # yougile-mcp 0.3.0 is on PyPI.
-      - uses: actions/checkout@v7
-        with:
-          repository: indalo-tech/yougile-mcp
-          path: yougile-mcp
       - uses: astral-sh/setup-uv@v10.2.0
       - name: Lint and test
-        working-directory: yougile-mcp-cloud
         run: |
           uv sync --locked
           uv run ruff format --check src tests
           uv run ruff check src tests
           uv run pytest -q
+
+  image:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: tag
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          # An immutable tag per commit (what deploys use, and what a rollback pins) and latest.
+          tags: |
+            ghcr.io/indalo-tech/yougile-mcp-cloud:${{ steps.tag.outputs.tag }}
+            ghcr.io/indalo-tech/yougile-mcp-cloud:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://yougile.indalo.ru
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - name: Deploy
+        env:
+          TAG: ${{ needs.image.outputs.tag }}
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # The key is pinned to deploy/deploy.sh on the server (command= in authorized_keys):
+          # the "command" below is only its arguments.
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes "deploy@$HOST" \
+            "$TAG $(sha256sum < deploy/compose.yaml | cut -d' ' -f1) $(sha256sum < deploy/yougile.caddy | cut -d' ' -f1)"
+          rm -f ~/.ssh/deploy_key
+      # The step above talks to the server; this checks what a client actually meets:
+      # DNS, TLS, Caddy and the app, over the public URL.
+      - name: Smoke test
+        run: |
+          base=https://yougile.indalo.ru
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors "$base/healthz"
+          curl -fsS "$base/.well-known/oauth-authorization-server" | grep -q "\"issuer\":\"$base/\""
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$base/mcp")" = 401
+          curl -fsS "$base/admin/login" | grep -q 'Управление YouGile MCP'

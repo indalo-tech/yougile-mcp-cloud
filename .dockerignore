@@ -1,0 +1,6 @@
+# The image needs only these; everything else (tests, .git, local .env files) stays out.
+*
+!pyproject.toml
+!uv.lock
+!src/
+**/__pycache__

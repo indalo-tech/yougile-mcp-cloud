@@ -1,0 +1,99 @@
+# YouGile MCP Cloud on one host: the app, PostgreSQL and Valkey.
+#
+# Settings and secrets come from .env next to this file (see env.example). Only the app is
+# published, and only on 127.0.0.1: the host's Caddy terminates TLS and proxies to it.
+# The server runs this file as installed; deploy.sh refuses to deploy while it differs from
+# the repo, so a change here is installed by hand first (see README.md).
+
+name: yougile-mcp-cloud
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  app:
+    image: ghcr.io/indalo-tech/yougile-mcp-cloud:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://yougile:${POSTGRES_PASSWORD:?}@postgres:5432/yougile
+      VALKEY_URL: valkey://:${VALKEY_PASSWORD:?}@valkey:6379/0
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # Caddy on the host reaches the container through the network's gateway; only that
+      # address may set X-Forwarded-For (client IPs feed the sign-in attempt limits).
+      FORWARDED_ALLOW_IPS: 172.31.77.1
+    ports:
+      - "127.0.0.1:${APP_PORT:-8100}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    restart: unless-stopped
+    logging: *logging
+    networks: [yougile]
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: yougile
+      POSTGRES_USER: yougile
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      # PostgreSQL 18 images keep data under /var/lib/postgresql/<version>.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yougile -d yougile"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    shm_size: 128mb
+    mem_limit: 512m
+    restart: unless-stopped
+    logging: *logging
+    networks: [yougile]
+
+  valkey:
+    image: valkey/valkey:9.2-alpine
+    # Everything stored here has a TTL (OAuth state, codes, sessions, counters).
+    command:
+      - valkey-server
+      - --requirepass
+      - ${VALKEY_PASSWORD:?set VALKEY_PASSWORD in .env}
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - volatile-lru
+    environment:
+      VALKEYCLI_AUTH: ${VALKEY_PASSWORD}
+    volumes:
+      - valkeydata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+    networks: [yougile]
+
+networks:
+  yougile:
+    ipam:
+      config:
+        - subnet: 172.31.77.0/24
+          gateway: 172.31.77.1
+
+volumes:
+  pgdata:
+  valkeydata:
