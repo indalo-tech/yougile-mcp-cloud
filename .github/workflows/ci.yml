@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: ygc
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+      valkey:
+        image: valkey/valkey:9.2-alpine
+        ports: ["56379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: yougile-mcp-cloud
+      # The public core sits next to this repo, as [tool.uv.sources] expects, until
+      # yougile-mcp 0.3.0 is on PyPI.
+      - uses: actions/checkout@v7
+        with:
+          repository: indalo-tech/yougile-mcp
+          path: yougile-mcp
+      - uses: astral-sh/setup-uv@v10.2.0
+      - name: Lint and test
+        working-directory: yougile-mcp-cloud
+        run: |
+          uv sync --locked
+          uv run ruff format --check src tests
+          uv run ruff check src tests
+          uv run pytest -q
