@@ -36,6 +36,7 @@ class User:
     api_key_enc: bytes
     updated_at: datetime
     last_seen_at: datetime | None = None
+    default_board: str | None = None  # board id chosen with yougile_use_board
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ def _user(row: dict) -> User:
         api_key_enc=bytes(row["api_key_enc"]),
         updated_at=row["updated_at"],
         last_seen_at=row["last_seen_at"],
+        default_board=row["default_board"],
     )
 
 
@@ -232,6 +234,10 @@ class Database:
 
     async def touch_user(self, user_id: int) -> None:
         await self._exec("UPDATE users SET last_seen_at = now() WHERE id = %s", (user_id,))
+
+    async def set_default_board(self, user_id: int, board_id: str | None) -> None:
+        # updated_at stays: the cached runtime already holds the choice, no rebuild needed
+        await self._exec("UPDATE users SET default_board = %s WHERE id = %s", (board_id, user_id))
 
     async def delete_user(self, user_id: int) -> None:
         await self._exec("DELETE FROM users WHERE id = %s", (user_id,))

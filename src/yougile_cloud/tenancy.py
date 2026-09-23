@@ -96,6 +96,8 @@ class Tenancy:
             settings_hint=f"the company admin page {self.settings.public_url}/admin "
             "(company admins only: people's rights are under Сотрудники, company rules and "
             "Workflow chains under Настройки)",
+            board=user.default_board,
+            save_board=lambda board: self.db.set_default_board(user.id, board),
         )
 
     async def runtime_for(self, user_id: int) -> runtime.Runtime:

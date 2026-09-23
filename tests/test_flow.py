@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
-from conftest import REDIRECT, exchange, register_client, sign_in, start_flow
+from conftest import REDIRECT, connect, exchange, register_client, sign_in, start_flow
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -63,6 +63,27 @@ async def test_full_flow_with_company_choice(server, settings, http, fake):
 
     user = (await server.db.list_users("c-main"))[0]
     assert user.is_admin and user.api_key_enc and b"u-anna" not in user.api_key_enc
+
+
+async def test_chosen_board_is_kept_for_the_person(server, settings, http):
+    _, anna = await connect(
+        http, settings, login="anna@example.com", password="right", company="c-main"
+    )
+    async with await mcp_client(settings, anna["access_token"]) as c:
+        chosen = (await c.call_tool("yougile_use_board", {"board": "Доска"})).data
+    assert chosen == {
+        "default_board": "Проект / Доска",
+        "kept": "for this person in every conversation",
+    }
+    user = (await server.db.list_users("c-main"))[0]
+    assert user.default_board == "b1"
+
+    server.tenancy._cache.clear()  # as after a restart: the choice comes from the database
+    async with await mcp_client(settings, anna["access_token"]) as c:
+        overview = (await c.call_tool("yougile_overview", {})).data
+        assert overview["defaults"]["board"] == "Проект / Доска"
+        await c.call_tool("yougile_use_board", {})
+    assert (await server.db.get_user(user.id)).default_board is None
 
 
 async def test_refresh_rotates_and_old_token_dies(server, settings, http):
