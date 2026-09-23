@@ -91,12 +91,14 @@ async def test_company_settings_reach_mcp_sessions(server, settings, http):
         assert overview["projects"][0]["boards"][0]["workflow"] == ["Очередь", "Готово"]
         assert overview["done_columns"] == ["Готово"]
         assert "role=reader" in overview["permissions"]
+        assert "/admin" in overview["settings_in"], "the assistant can give the admin link"
         result = await c.call_tool(
             "yougile_tasks",
             {"operation": "create", "params": {"title": "x", "columnId": "k1"}},
             raise_on_error=False,
         )
         assert result.is_error and "reader" in str(result.content)
+        assert "/admin" in str(result.content), "a refusal says where rights are changed"
         standup = await c.get_prompt("standup")
         assert "Asia/Yerevan" in standup.messages[0].content.text, "prompts follow company time"
 

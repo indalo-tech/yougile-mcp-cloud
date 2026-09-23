@@ -94,7 +94,8 @@ class Tenancy:
             Directory(client),
             allow_local_files=False,
             settings_hint=f"the company admin page {self.settings.public_url}/admin "
-            "(company admins only; Workflow chains are under Настройки)",
+            "(company admins only: people's rights are under Сотрудники, company rules and "
+            "Workflow chains under Настройки)",
         )
 
     async def runtime_for(self, user_id: int) -> runtime.Runtime:
