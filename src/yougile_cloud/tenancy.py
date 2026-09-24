@@ -127,6 +127,13 @@ class Tenancy:
                 asyncio.create_task(old.runtime.client.aclose())  # noqa: RUF006
         return entry.runtime
 
+    async def caller_runtime(self) -> runtime.Runtime:
+        """The runtime of the person behind the current request's access token."""
+        token = get_access_token()
+        if token is None or not token.subject:
+            raise ToolError("Нет авторизации: подключите YouGile MCP заново.")
+        return await self.runtime_for(int(token.subject))
+
     def forget(self, user_id: int) -> None:
         entry = self._cache.pop(user_id, None)
         if entry:
@@ -147,10 +154,7 @@ class TenantMiddleware(Middleware):
         self.tenancy = tenancy  # resolved per call: the Tenancy is created at startup
 
     async def _bound(self, context: MiddlewareContext, call_next: CallNext) -> Any:
-        token = get_access_token()
-        if token is None or not token.subject:
-            raise ToolError("Нет авторизации: подключите YouGile MCP заново.")
-        rt = await self.tenancy().runtime_for(int(token.subject))
+        rt = await self.tenancy().caller_runtime()
         bound = runtime.bind(rt)
         try:
             return await call_next(context)

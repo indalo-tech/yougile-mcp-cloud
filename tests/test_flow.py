@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 from conftest import REDIRECT, connect, exchange, register_client, sign_in, start_flow
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from mcp.types import PromptReference
 
 
 def code_from(resp) -> str:  # noqa: ANN001
@@ -82,6 +83,10 @@ async def test_chosen_board_is_kept_for_the_person(server, settings, http):
     async with await mcp_client(settings, anna["access_token"]) as c:
         overview = (await c.call_tool("yougile_overview", {})).data
         assert overview["defaults"]["board"] == "Проект / Доска"
+        # completion requests skip middleware; the server still finds the person's company
+        ref = PromptReference(type="ref/prompt", name="triage")
+        found = await c.complete(ref, {"name": "board", "value": "до"})
+        assert found.values == ["Проект / Доска"]
         await c.call_tool("yougile_use_board", {})
     assert (await server.db.get_user(user.id)).default_board is None
 

@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "Indalo" }]
 dependencies = [
-    "yougile-mcp>=0.10.0",
+    "yougile-mcp>=0.11.0",
     "psycopg[binary,pool]>=3.3.6",
     "valkey-glide>=2.5.2",
     "cryptography>=50",
@@ -29,7 +29,7 @@ dev = [
 # fresh release wheel is pinned by URL; uv.lock holds its hash. Drop this section and run
 # `uv lock` once https://pypi.org/simple/yougile-mcp/ lists the pinned version.
 [tool.uv.sources]
-yougile-mcp = { url = "https://files.pythonhosted.org/packages/8a/c1/017f0d0171d275c8f0872187c60da2e1b1b4023333a14b76f445a659e9b5/yougile_mcp-0.10.0-py3-none-any.whl" }
+yougile-mcp = { url = "https://files.pythonhosted.org/packages/1a/84/b21d656de77bbde259c899bb5e60360be8cb1a932314e1c6aff65c01b6d5/yougile_mcp-0.11.0-py3-none-any.whl" }
 
 [build-system]
 requires = ["hatchling>=1.32"]

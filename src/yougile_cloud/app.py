@@ -71,6 +71,8 @@ def create_server(settings: Settings, *, transport: Any = None) -> tuple[FastMCP
     mcp = build_server(
         auth=services.provider,
         middleware=[TenantMiddleware(lambda: services.tenancy)],
+        # completion requests skip middleware: the core asks for the caller's runtime itself
+        resolve_runtime=lambda: services.tenancy.caller_runtime(),
         lifespan=lifespan,
     )
     mcp.custom_route("/", methods=["GET"])(services.pages.home)
