@@ -18,6 +18,7 @@ from glide import (
     Script,
     ServerCredentials,
 )
+from yougile_mcp import progress
 from yougile_mcp.client import YouGileError
 
 # Sliding window per bucket. Uses the server clock so every worker agrees on time.
@@ -155,6 +156,7 @@ class CompanyRateLimiter:
                 raise YouGileError(
                     429, "the company's YouGile request budget is exhausted; retry in a minute"
                 )
+            await progress.report(progress.rate_limit_note(wait))
             await asyncio.sleep(min(wait, self.MAX_SLEEP))
 
     async def penalize(self, seconds: float) -> None:
