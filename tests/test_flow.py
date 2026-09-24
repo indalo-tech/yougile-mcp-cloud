@@ -26,7 +26,8 @@ async def mcp_client(settings, token: str) -> Client:  # noqa: ANN001
     )
 
 
-async def test_full_flow_with_company_choice(server, settings, http, fake):
+async def test_full_flow_with_company_choice(server, settings, http, fake, caplog):
+    caplog.set_level("INFO", logger="yougile_cloud.requestlog")
     client_id = await register_client(http)
     signin_path, verifier = await start_flow(http, settings, client_id)
     resp = await sign_in(
@@ -61,6 +62,9 @@ async def test_full_flow_with_company_choice(server, settings, http, fake):
             raise_on_error=False,
         )
         assert result.is_error and "not available on this server" in str(result.content)
+    # the request log names the tool and the client's announced extensions
+    assert "mcp tools/call yougile_overview" in caplog.text
+    assert "mcp tools/list client=" in caplog.text and "extensions=[" in caplog.text
 
     user = (await server.db.list_users("c-main"))[0]
     assert user.is_admin and user.api_key_enc and b"u-anna" not in user.api_key_enc

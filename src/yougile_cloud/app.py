@@ -15,6 +15,7 @@ from .crypto import Secrets
 from .db import Database
 from .kv import KV
 from .oauth import CloudOAuthProvider
+from .requestlog import RequestLog
 from .settings import Settings
 from .signin import SignIn
 from .tenancy import Tenancy, TenantMiddleware
@@ -70,7 +71,7 @@ def create_server(settings: Settings, *, transport: Any = None) -> tuple[FastMCP
 
     mcp = build_server(
         auth=services.provider,
-        middleware=[TenantMiddleware(lambda: services.tenancy)],
+        middleware=[RequestLog(), TenantMiddleware(lambda: services.tenancy)],
         # completion requests skip middleware: the core asks for the caller's runtime itself
         resolve_runtime=lambda: services.tenancy.caller_runtime(),
         lifespan=lifespan,
