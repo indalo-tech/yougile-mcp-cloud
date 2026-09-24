@@ -86,6 +86,8 @@ async def test_company_settings_reach_mcp_sessions(server, settings, http):
 
     server.tenancy._cache.clear()
     async with mcp(settings, bob["access_token"]) as c:
+        tools = {t.name for t in await c.list_tools()}
+        assert "yougile_overview" in tools and "yougile_create_task" not in tools, "reader"
         overview = (await c.call_tool("yougile_overview", {})).data
         assert (overview["company_rules"], overview["timezone"]) == ("Пиши кратко", "Asia/Yerevan")
         assert overview["projects"][0]["boards"][0]["workflow"] == ["Очередь", "Готово"]

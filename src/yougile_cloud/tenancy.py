@@ -139,8 +139,9 @@ class Tenancy:
 
 
 class TenantMiddleware(Middleware):
-    """Binds the caller's runtime around tool calls and prompt rendering (prompts need the
-    company's time zone); listings need no tenant."""
+    """Binds the caller's runtime around tool calls, prompt rendering (prompts need the
+    company's time zone) and tool listings (the core shows each person only what their rights
+    allow)."""
 
     def __init__(self, tenancy: Callable[[], Tenancy]) -> None:
         self.tenancy = tenancy  # resolved per call: the Tenancy is created at startup
@@ -161,3 +162,11 @@ class TenantMiddleware(Middleware):
 
     async def on_get_prompt(self, context: MiddlewareContext, call_next: CallNext) -> Any:
         return await self._bound(context, call_next)
+
+    async def on_list_tools(self, context: MiddlewareContext, call_next: CallNext) -> Any:
+        try:
+            return await self._bound(context, call_next)
+        except ToolError:
+            # No usable runtime (expired access, stale session): list everything; the calls
+            # themselves explain what is wrong.
+            return await call_next(context)
