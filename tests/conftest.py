@@ -119,7 +119,7 @@ class FakeYouGile:
             if cid == company
         ]
         lists = {
-            "/projects": [{"id": "p1", "title": "Проект"}],
+            "/projects": [{"id": "p1", "title": "Проект"}, {"id": "p2", "title": "Клиенты"}],
             "/boards": [{"id": "b1", "title": "Доска", "projectId": "p1"}],
             "/columns": [
                 {"id": "k1", "title": "Очередь", "boardId": "b1"},

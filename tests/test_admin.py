@@ -234,3 +234,35 @@ async def test_logout(server, settings, http):
     )
     assert resp.status_code == 303 and resp.headers["location"] == "/admin/login"
     assert (await http.get("/admin")).status_code == 303
+
+
+async def test_client_copies_setting_reaches_mcp_sessions(server, settings, http):
+    _, bob = await connect(http, settings, login="bob@example.com", password="pw")
+    await admin_login(http, settings)
+    page = await http.get("/admin/settings")
+    base = {"csrf": field(page.text, "csrf"), "default_role": "member", "timezone": "Europe/Moscow"}
+
+    same = await http.post(
+        "/admin/settings",
+        data={**base, "copy_from": "p1", "copy_to": "p1"},
+        headers=origin(settings),
+    )
+    assert same.status_code == 400 and "два разных проекта" in same.text
+
+    resp = await http.post(
+        "/admin/settings",
+        data={**base, "copy_from": "p1", "copy_to": "p2", "copy_rules": "Коротко"},
+        headers=origin(settings),
+    )
+    assert resp.status_code == 303
+    stored = (await server.db.get_company("c-main")).settings
+    assert stored["client_copy"] == {"from": "Проект", "to": "Клиенты", "rules": "Коротко"}
+    page = await http.get("/admin/settings")
+    assert '<option value="p2" selected>Клиенты</option>' in page.text
+
+    server.tenancy._cache.clear()
+    async with mcp(settings, bob["access_token"]) as c:
+        tools = {t.name for t in await c.list_tools()}
+        overview = (await c.call_tool("yougile_overview", {})).data
+    assert {"yougile_client_copy", "yougile_client_copies"} <= tools
+    assert overview["client_copy"] == {"from": "Проект", "to": "Клиенты", "rules": "Коротко"}

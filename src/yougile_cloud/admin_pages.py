@@ -8,6 +8,8 @@ from functools import cache
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, available_timezones
 
+from yougile_mcp.copies import DEFAULT_RULES as DEFAULT_COPY_RULES
+
 from .access import Access
 from .db import Company, Rights, User
 from .pages import e, page
@@ -65,6 +67,9 @@ class SettingsForm:
     deny: set[str] = field(default_factory=set)
     workflows: str = ""
     done: set[str] = field(default_factory=set)  # column titles that mean "done"
+    copy_from: str = ""  # client copies: the internal project's id ("" = off)
+    copy_to: str = ""  # ... and the client project's id
+    copy_rules: str = ""
 
 
 @dataclass
@@ -236,6 +241,32 @@ def _done_boxes(columns: list[str], checked: set[str]) -> str:
     return f'<div class="list">{boxes}</div>'
 
 
+def _project_select(name: str, projects: list[tuple[str, str]], chosen: str) -> str:
+    options = '<option value="">— выключено —</option>' + "".join(
+        f'<option value="{e(pid)}"{" selected" if pid == chosen else ""}>{e(title)}</option>'
+        for pid, title in projects
+    )
+    return f'<select id="{name}" name="{name}">{options}</select>'
+
+
+def _client_copy_fields(values: SettingsForm, projects: list[tuple[str, str]]) -> str:
+    return (
+        "<fieldset><legend>Клиентские копии задач</legend>"
+        '<label for="copy_from">Внутренний проект</label>'
+        + _project_select("copy_from", projects, values.copy_from)
+        + '<label for="copy_to">Проект для клиента</label>'
+        + _project_select("copy_to", projects, values.copy_to)
+        + '<label for="copy_rules">Правила клиентского текста</label>'
+        f'<textarea class="prose" id="copy_rules" name="copy_rules" maxlength="4000" '
+        f'placeholder="{e(DEFAULT_COPY_RULES)}">{e(values.copy_rules)}</textarea>'
+        '<p class="hint">Задачи внутреннего проекта по заказам клиента получают копию в '
+        "проекте для клиента: на доске и в колонке с тем же названием, с заголовком и описанием "
+        "для клиента — без внутренних кодов, технических деталей и личных данных. Во внутренней "
+        "карточке появляется строка «Карточка для клиента: ID-…»; дальше перенос, часы и срок "
+        "копируются сами. Пустые правила — встроенные (видны серым в поле).</p></fieldset>"
+    )
+
+
 def settings_page(
     frame: Frame,
     values: SettingsForm,
@@ -279,7 +310,8 @@ def settings_page(
         "не отметили выполненными. Перенося задачу в такую колонку, он сам отмечает её "
         "выполненной — YouGile запоминает дату, и задача попадает в стендап и отчёты за период. "
         "У задач, перенесённых вручную без отметки, даты нет.</p></fieldset>"
-        '<label for="timezone">Часовой пояс</label>'
+        + _client_copy_fields(values, projects)
+        + '<label for="timezone">Часовой пояс</label>'
         f'<input type="text" id="timezone" name="timezone" list="zones" '
         f'value="{e(values.timezone)}" autocomplete="off"><datalist id="zones">{zones}</datalist>'
         '<p class="hint">Для сроков задач и дат без времени. Например, Europe/Moscow.</p>'

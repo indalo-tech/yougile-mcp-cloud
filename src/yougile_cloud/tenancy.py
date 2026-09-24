@@ -28,7 +28,14 @@ from .db import Company, Database, Rights, User
 from .kv import KV, CompanyRateLimiter
 from .settings import Settings
 
-COMPANY_KEYS = ("timezone", "instructions", "confirm_projects", "workflows", "done_columns")
+COMPANY_KEYS = (
+    "timezone",
+    "instructions",
+    "confirm_projects",
+    "workflows",
+    "done_columns",
+    "client_copy",
+)
 
 
 def workspace_config(company: Company, rights: Rights | None) -> WorkspaceConfig:

@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "Indalo" }]
 dependencies = [
-    "yougile-mcp[apps]>=0.15.0",  # apps: the MCP Apps screens
+    "yougile-mcp[apps]>=0.16.0",  # apps: the MCP Apps screens
     "psycopg[binary,pool]>=3.3.6",
     "valkey-glide>=2.5.2",
     "cryptography>=50",
@@ -24,6 +24,12 @@ dev = [
     "pytest-asyncio>=1.4",
     "ruff>=0.16",
 ]
+
+# PyPI's index (a CDN cache) shows a new yougile-mcp release only after a long delay, so a
+# fresh release wheel is pinned by URL; uv.lock holds its hash. Drop this section and run
+# `uv lock` once https://pypi.org/simple/yougile-mcp/ lists the pinned version.
+[tool.uv.sources]
+yougile-mcp = { url = "https://files.pythonhosted.org/packages/47/99/9cc75e00c2f47ae2a5c7ededbf7da7afb791f205de1494e70ad6beefefe6/yougile_mcp-0.16.0-py3-none-any.whl" }
 
 [build-system]
 requires = ["hatchling>=1.32"]

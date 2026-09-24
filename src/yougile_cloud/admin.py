@@ -96,6 +96,37 @@ def _pick_titles(refs: Iterable[str], titles: list[str]) -> set[str]:
     return {title for title in titles if _norm(title) in wanted}
 
 
+def _copy_values(stored: Any, projects: list[tuple[str, str]]) -> dict[str, str]:
+    """The client-copy setting (projects stored by title) as the form shows it."""
+    if not isinstance(stored, dict):
+        return {}
+    by_title = {_norm(title): pid for pid, title in projects}
+    return {
+        "copy_from": by_title.get(_norm(str(stored.get("from", ""))), ""),
+        "copy_to": by_title.get(_norm(str(stored.get("to", ""))), ""),
+        "copy_rules": str(stored.get("rules") or ""),
+    }
+
+
+def _client_copy(
+    values: Any, projects: list[tuple[str, str]]
+) -> tuple[dict[str, str] | None, list[str]]:
+    """The setting to store (projects by title, as people and the assistant read them)."""
+    titles = dict(projects)
+    source, target = values.copy_from, values.copy_to
+    if not source and not target:
+        return None, []
+    if not source or not target:
+        return None, ["Для клиентских копий выберите оба проекта — или ни одного."]
+    if source not in titles or target not in titles:
+        return None, ["Выберите проекты для клиентских копий из списка."]
+    if source == target:
+        return None, ["Для клиентских копий нужны два разных проекта."]
+    if len(values.copy_rules) > MAX_INSTRUCTIONS:
+        return None, [f"Правила клиентского текста длиннее {MAX_INSTRUCTIONS} символов."]
+    return {"from": titles[source], "to": titles[target], "rules": values.copy_rules}, []
+
+
 def _choice(value: Any, allowed: Iterable[str], default: str) -> str:
     return value if isinstance(value, str) and value in allowed else default
 
@@ -477,6 +508,7 @@ class AdminPages:
             deny=ctx.frame.company_denied,
             workflows=format_workflows(s.get("workflows", {})),
             done=_pick_titles(s.get("done_columns", []), columns),
+            **_copy_values(s.get("client_copy"), projects),
         )
         done = request.query_params.get("done")
         return self._html(ui.settings_page(ctx.frame, values, projects, columns, done=done))
@@ -497,6 +529,9 @@ class AdminPages:
             deny={str(k) for k in form.getlist("deny")},
             workflows=str(form.get("workflows", "")).replace("\r\n", "\n").strip(),
             done=_pick_titles([str(v) for v in form.getlist("done")], columns),
+            copy_from=str(form.get("copy_from", "")),
+            copy_to=str(form.get("copy_to", "")),
+            copy_rules=str(form.get("copy_rules", "")).replace("\r\n", "\n").strip(),
         )
         errors: list[str] = []
         if values.timezone not in ui.timezones():
@@ -507,6 +542,8 @@ class AdminPages:
             errors.append(f"Правила длиннее {MAX_INSTRUCTIONS} символов — сократите их.")
         workflows, workflow_errors = parse_workflows(values.workflows, structure)
         errors += workflow_errors
+        client_copy, copy_errors = _client_copy(values, projects)
+        errors += copy_errors
         new = {
             **ctx.session.company.settings,
             "timezone": values.timezone,
@@ -516,10 +553,18 @@ class AdminPages:
             "deny": deny_list(values.deny),
             "workflows": workflows,
             "done_columns": [title for title in columns if title in values.done],
+            "client_copy": client_copy,
         }
         if not errors:
             try:  # the same check the MCP side runs: a bad value must never reach it
-                keys = ("timezone", "instructions", "workflows", "deny", "done_columns")
+                keys = (
+                    "timezone",
+                    "instructions",
+                    "workflows",
+                    "deny",
+                    "done_columns",
+                    "client_copy",
+                )
                 WorkspaceConfig.from_dict(
                     {k: new[k] for k in keys}
                     | {"role": new["default_role"], "confirm_projects": new["confirm_projects"]}
@@ -540,6 +585,7 @@ class AdminPages:
             confirm_projects=new["confirm_projects"],
             workflows=list(workflows),
             done_columns=new["done_columns"],
+            client_copy=client_copy,
         )
         return _redirect("/admin/settings?done=settings")
 
