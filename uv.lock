@@ -1428,14 +1428,15 @@ wheels = [
 [[package]]
 name = "yougile-mcp"
 version = "0.18.0"
-source = { url = "https://files.pythonhosted.org/packages/e2/e0/5ee8c69e7045a2da71e607875092d26278c7a8316d818dc5a2d82ef4fd96/yougile_mcp-0.18.0-py3-none-any.whl" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastmcp" },
     { name = "httpx2" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/aa/c5/910d9a78cafdaf2c4fa74a00e543b4ca29a3b20f5addefae817fe922d2e1/yougile_mcp-0.18.0.tar.gz", hash = "sha256:8668cac2aebe40cbc0e0f501522f03d2825ab012011ea54e31d6c1f8ee8cb274", size = 244328, upload-time = "2026-09-25T10:40:23.041Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/e0/5ee8c69e7045a2da71e607875092d26278c7a8316d818dc5a2d82ef4fd96/yougile_mcp-0.18.0-py3-none-any.whl", hash = "sha256:d5b5946a6892a45134a749d6216aaadb10a49a74a43a9ea746d91db843bbaf92" },
+    { url = "https://files.pythonhosted.org/packages/e2/e0/5ee8c69e7045a2da71e607875092d26278c7a8316d818dc5a2d82ef4fd96/yougile_mcp-0.18.0-py3-none-any.whl", hash = "sha256:d5b5946a6892a45134a749d6216aaadb10a49a74a43a9ea746d91db843bbaf92", size = 128544, upload-time = "2026-09-25T10:40:21.481Z" },
 ]
 
 [package.optional-dependencies]
@@ -1443,16 +1444,6 @@ apps = [
     { name = "fastmcp", extra = ["apps"] },
     { name = "prefab-ui" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastmcp", specifier = ">=4.0.5,<5" },
-    { name = "fastmcp", extras = ["apps"], marker = "extra == 'apps'", specifier = ">=4.0.5,<5" },
-    { name = "httpx2", specifier = ">=2.13" },
-    { name = "prefab-ui", marker = "extra == 'apps'", specifier = "==0.20.2" },
-    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2025.2" },
-]
-provides-extras = ["apps"]
 
 [[package]]
 name = "yougile-mcp-cloud"
@@ -1481,7 +1472,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "uvicorn", specifier = ">=0.53" },
     { name = "valkey-glide", specifier = ">=2.5.2" },
-    { name = "yougile-mcp", extras = ["apps"], url = "https://files.pythonhosted.org/packages/e2/e0/5ee8c69e7045a2da71e607875092d26278c7a8316d818dc5a2d82ef4fd96/yougile_mcp-0.18.0-py3-none-any.whl" },
+    { name = "yougile-mcp", extras = ["apps"], specifier = ">=0.18.0" },
 ]
 
 [package.metadata.requires-dev]
