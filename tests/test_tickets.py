@@ -29,9 +29,13 @@ FILE_MARK = "/root/#file:"
 
 class FakeTelegram:
     def __init__(self) -> None:
-        self.sent: list[dict] = []  # sendMessage / sendDocument bodies
+        self.sent: list[dict] = []  # sendMessage bodies
         self.calls: list[str] = []
         self.next_id = 1000
+        self.topics_on = False  # Threaded Mode in @BotFather
+        self.refuse_topics = False  # createForumTopic fails
+        self.dead_threads: set[int] = set()  # topics Telegram no longer knows
+        self.topics: dict[int, str] = {}  # thread id: name
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
@@ -41,16 +45,41 @@ class FakeTelegram:
         self.calls.append(method)
         body = json.loads(request.content) if request.content else {}
         result: Any = True
+        if method == "sendMessage" and body.get("message_thread_id") in self.dead_threads:
+            return httpx2.Response(
+                400,
+                json={"ok": False, "error_code": 400, "description": "message thread not found"},
+            )
         if method == "sendMessage":
             self.next_id += 1
             self.sent.append(body)
             result = {"message_id": self.next_id, "chat": {"id": body["chat_id"]}}
+        elif method == "getMe":
+            result = {"id": 1, "is_bot": True, "has_topics_enabled": self.topics_on}
+        elif method == "createForumTopic":
+            if self.refuse_topics:
+                return httpx2.Response(
+                    400,
+                    json={
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "BOT_FORUM_CREATE_FORBIDDEN",
+                    },
+                )
+            thread = 500 + len(self.topics)
+            self.topics[thread] = body["name"]
+            result = {"message_thread_id": thread, "name": body["name"], "icon_color": 0}
+        elif method == "editForumTopic":
+            self.topics[body["message_thread_id"]] = body["name"]
         elif method == "getFile":
             result = {"file_id": body["file_id"], "file_path": f"photos/{body['file_id']}.jpg"}
         return httpx2.Response(200, json={"ok": True, "result": result})
 
     def to(self, chat: int) -> list[str]:
         return [m["text"] for m in self.sent if m["chat_id"] == chat]
+
+    def last(self, chat: int) -> dict:
+        return [m for m in self.sent if m["chat_id"] == chat][-1]
 
 
 class FakeYouGile:
@@ -477,6 +506,91 @@ async def test_someone_elses_ticket_is_out_of_reach(bot, store, tg, yg):
     await bot.handle(tap(EVE, "reply:t-1"))
     await bot.handle(text(EVE, "чужая"))
     assert all("чужая" not in m["text"] for m in yg.chats["t-1"])
+
+
+# ---------------- topics ----------------
+
+
+def in_topic(uid: int, thread: int, value: str) -> dict:
+    update = text(uid, value)
+    update["message"] |= {"message_thread_id": thread, "is_topic_message": True}
+    return update
+
+
+async def test_each_ticket_gets_its_own_topic(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    assert tg.topics == {500: "ID-1 · Не приходят уведомления"}
+    assert (await store.ticket("t-1")).tg_thread_id == 500
+    accepted = [m for m in tg.sent if "принята" in m["text"]]
+    assert accepted[0]["message_thread_id"] == 500 and "reply_markup" not in accepted[0]
+    assert "в отдельной теме" in accepted[1]["text"] and "message_thread_id" not in accepted[1]
+
+    yg.tasks["t-1"]["columnId"] = "c-work"
+    yg.message("t-1", "u-dev", "На каком филиале?")
+    await bot.refresh("t-1")
+    status, question = tg.sent[-2], tg.sent[-1]
+    assert status["message_thread_id"] == 500 and status["text"].endswith("В работе.")
+    assert question["message_thread_id"] == 500 and "На каком филиале?" in question["text"]
+
+    # Written in the topic: goes to the ticket, the answer comes back into the topic.
+    await bot.handle(in_topic(ANNA, 500, "На Невском"))
+    assert yg.chats["t-1"][-1]["text"].endswith("На Невском")
+    assert tg.last(ANNA)["message_thread_id"] == 500
+    assert "Передал в заявку" in tg.last(ANNA)["text"]
+
+    # The menu still works from inside a topic, and answers there.
+    await bot.handle(in_topic(ANNA, 500, MINE))
+    assert "ID-1" in tg.last(ANNA)["text"] and tg.last(ANNA)["message_thread_id"] == 500
+
+    yg.tasks["t-1"]["columnId"] = "c-done"
+    await bot.refresh("t-1")
+    assert tg.topics[500] == "✅ ID-1 · Не приходят уведомления"  # kept as history, marked
+    yg.tasks["t-1"]["columnId"] = "c-work"  # reopened
+    await bot.refresh("t-1")
+    assert tg.topics[500] == "ID-1 · Не приходят уведомления"
+    yg.tasks["t-1"]["deleted"] = True
+    await bot.refresh("t-1")
+    assert tg.topics[500] == "✖ ID-1 · Не приходят уведомления"
+
+
+async def test_a_new_ticket_written_inside_a_topic_is_not_sent_to_that_topics_ticket(
+    bot, store, tg, yg
+):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    before = len(yg.chats["t-1"])
+    await bot.handle(in_topic(ANNA, 500, NEW))
+    await bot.handle(in_topic(ANNA, 500, "Второй вопрос"))
+    await bot.handle(in_topic(ANNA, 500, "Подробности"))
+    await bot.handle(tap(ANNA, "send"))
+    assert len(yg.chats["t-1"]) == before
+    assert yg.tasks["t-2"]["title"] == "Второй вопрос"
+    assert tg.topics[501] == "ID-2 · Второй вопрос"
+
+
+async def test_without_topics_the_main_chat_is_used(bot, store, tg, yg):
+    tg.topics_on, tg.refuse_topics = True, True
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    assert (await store.ticket("t-1")).tg_thread_id is None
+    accepted = [m for m in tg.sent if "принята" in m["text"]][-1]
+    assert buttons(accepted) == ["reply:t-1"] and "message_thread_id" not in accepted
+
+
+async def test_a_topic_telegram_lost_falls_back_to_the_main_chat(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    tg.dead_threads.add(500)
+    yg.message("t-1", "u-dev", "Вопрос")
+    await bot.refresh("t-1")
+    last = tg.last(ANNA)
+    assert "Вопрос" in last["text"] and "message_thread_id" not in last
+    assert buttons(last) == ["reply:t-1"]
+    assert (await store.ticket("t-1")).tg_thread_id is None
 
 
 # ---------------- webhook endpoint and helpers ----------------

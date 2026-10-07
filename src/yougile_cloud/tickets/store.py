@@ -50,6 +50,7 @@ class Ticket:
     deleted: bool
     last_message_id: int
     created_at: datetime
+    tg_thread_id: int | None  # the ticket's topic in the sender's chat
 
 
 def _account(row: dict) -> Account:
@@ -224,7 +225,7 @@ class TicketStore:
         return [_ticket(r) for r in rows]
 
     async def update_ticket(self, task_id: str, **fields: Any) -> None:
-        allowed = {"title", "column_id", "completed", "deleted", "last_message_id"}
+        allowed = {"title", "column_id", "completed", "deleted", "last_message_id", "tg_thread_id"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"cannot update {sorted(set(fields) - allowed)}")
         sets = ", ".join(f"{k} = %s" for k in fields)
@@ -246,6 +247,13 @@ class TicketStore:
         row = await self.db._one(
             "SELECT task_id FROM ticket_tg_messages WHERE tg_chat_id = %s AND tg_message_id = %s",
             (tg_chat_id, tg_message_id),
+        )
+        return row["task_id"] if row else None
+
+    async def ticket_of_thread(self, tg_user_id: int, thread: int) -> str | None:
+        row = await self.db._one(
+            "SELECT task_id FROM tickets WHERE tg_user_id = %s AND tg_thread_id = %s",
+            (tg_user_id, thread),
         )
         return row["task_id"] if row else None
 

@@ -7,6 +7,7 @@ import html
 import logging
 import time
 from collections import defaultdict
+from contextvars import ContextVar
 from typing import Any
 
 from yougile_mcp.client import YouGileError
@@ -25,6 +26,11 @@ DONE_COLUMNS = {"готово"}
 MAX_TITLE = 200
 MAX_FILES = 10
 MAX_TEXT = 3500  # Telegram allows 4096 characters per message
+MAX_TOPIC = 128  # characters in a topic's name
+TOPICS_RECHECK = 600.0  # seconds between checks that the bot's topics are on (@BotFather)
+
+# The topic the message being handled came from: answers go back there.
+_thread: ContextVar[int | None] = ContextVar("ticket_bot_thread", default=None)
 
 ASK_NAME = (
     "Здравствуйте! Это бот для заявок команде Indalo.\n\n"
@@ -86,6 +92,16 @@ def _size(item: dict) -> dict:
     return {"size": int(item.get("file_size") or 0)}
 
 
+def thread_of(msg: dict) -> int | None:
+    """The topic of a message in the private chat; None for the main one (General is 1)."""
+    thread = msg.get("message_thread_id") if msg.get("is_topic_message") else None
+    return thread if thread and thread != 1 else None
+
+
+def topic_name(number: str, title: str, mark: str = "") -> str:
+    return clip(f"{mark}{number} · {title}", MAX_TOPIC)
+
+
 def is_done(task: dict, column_title: str) -> bool:
     return bool(task.get("completed")) or column_title.strip().lower() in DONE_COLUMNS
 
@@ -125,22 +141,50 @@ class TicketBot:
         self.desks = desks
         self.admins = admins
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._topics: tuple[float, bool] | None = None
 
     # ================= Telegram side =================
 
     async def handle(self, update: dict) -> None:
-        if msg := update.get("message"):
-            if (msg.get("chat") or {}).get("type") == "private" and msg.get("from"):
-                await self.on_message(msg)
-        elif cq := update.get("callback_query"):
-            await self.on_callback(cq)
+        msg = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+        token = _thread.set(thread_of(msg))
+        try:
+            if update.get("message"):
+                if (msg.get("chat") or {}).get("type") == "private" and msg.get("from"):
+                    await self.on_message(msg)
+            elif cq := update.get("callback_query"):
+                await self.on_callback(cq)
+        finally:
+            _thread.reset(token)
+
+    async def reply(self, chat: int, text: str, *, markup: dict | None = None) -> dict:
+        """Answer where the person wrote: in the topic they wrote in, if any."""
+        thread = _thread.get()
+        try:
+            return await self.tg.send(chat, text, markup=markup, thread=thread)
+        except TelegramError as exc:
+            if not thread or exc.code != 400:
+                raise
+            return await self.tg.send(chat, text, markup=markup)
+
+    async def topics_enabled(self) -> bool:
+        """Whether topics are on for the bot (Threaded Mode in @BotFather)."""
+        now = time.monotonic()
+        if self._topics is None or now - self._topics[0] > TOPICS_RECHECK:
+            try:
+                me = await self.tg.call("getMe")
+                self._topics = (now, bool(me.get("has_topics_enabled")))
+            except TelegramError as exc:
+                log.info("getMe: %s", exc)
+                self._topics = (now, False)
+        return self._topics[1]
 
     async def on_message(self, msg: dict) -> None:
         uid = msg["from"]["id"]
         chat = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
         if text == "/id":
-            await self.tg.send(chat, f"Ваш Telegram id: <code>{uid}</code>")
+            await self.reply(chat, f"Ваш Telegram id: <code>{uid}</code>")
             return
         if text == "/senders" and uid in self.admins:
             await self.list_senders(chat)
@@ -153,35 +197,42 @@ class TicketBot:
 
         if text in ("/start", "/menu", "/help"):
             await self.store.save_draft(uid, {})
-            await self.tg.send(chat, HELP, markup=MENU)
+            await self.reply(chat, HELP, markup=MENU)
             return
         if text in ("/cancel", "Отмена", "Отменить"):
             await self.store.save_draft(uid, {})
-            await self.tg.send(chat, "Отменено.", markup=MENU)
+            await self.reply(chat, "Отменено.", markup=MENU)
             return
         if text in (NEW, "/new"):
             await self.store.save_draft(uid, {"step": "title"})
-            await self.tg.send(chat, ASK_TITLE)
+            await self.reply(chat, ASK_TITLE)
             return
         if text in (MINE, "/my"):
             await self.list_tickets(chat, uid)
             return
 
+        # A ticket being written takes everything; then a reply started with the button; then
+        # the ticket's own topic; then a reply to a message about a ticket.
+        step = draft.get("step")
+        if step == "title":
+            await self.take_title(chat, uid, draft, msg, text)
+            return
+        if step == "details":
+            await self.take_details(chat, uid, draft, msg, text)
+            return
+        if step == "reply":
+            await self.store.save_draft(uid, {})
+            await self.relay(sender, msg, draft["task_id"])
+            return
+        thread = thread_of(msg)
+        if thread and (task_id := await self.store.ticket_of_thread(chat, thread)):
+            await self.relay(sender, msg, task_id)
+            return
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
         if reply_to and (task_id := await self.store.ticket_of_message(chat, reply_to)):
             await self.relay(sender, msg, task_id)
             return
-
-        step = draft.get("step")
-        if step == "title":
-            await self.take_title(chat, uid, draft, msg, text)
-        elif step == "details":
-            await self.take_details(chat, uid, draft, msg, text)
-        elif step == "reply":
-            await self.store.save_draft(uid, {})
-            await self.relay(sender, msg, draft["task_id"])
-        else:
-            await self.tg.send(chat, HELP, markup=MENU)
+        await self.reply(chat, HELP, markup=MENU)
 
     async def stranger(self, msg: dict, sender: Sender | None, text: str) -> None:
         """Someone without access: ask who they are, pass the request to the approvers."""
@@ -189,19 +240,19 @@ class TicketBot:
         if sender and sender.status == "blocked":
             return
         if sender and sender.status == "pending":
-            await self.tg.send(
+            await self.reply(
                 chat, "Запрос на доступ ещё рассматривается. Напишу, как только решат."
             )
             return
         draft = await self.store.draft(uid)
         if draft.get("step") != "intro" or not text or text.startswith("/"):
             await self.store.save_draft(uid, {"step": "intro"})
-            await self.tg.send(chat, ASK_NAME, markup=NO_MENU)
+            await self.reply(chat, ASK_NAME, markup=NO_MENU)
             return
         user = msg["from"]
         sender = await self.store.request_access(uid, clip(text, 200), user.get("username") or "")
         await self.store.save_draft(uid, {})
-        await self.tg.send(chat, "Спасибо! Запрос на доступ отправлен. Напишу, когда его одобрят.")
+        await self.reply(chat, "Спасибо! Запрос на доступ отправлен. Напишу, когда его одобрят.")
         await self.ask_approvers(sender, user)
 
     async def choices(self) -> list[tuple[str, str]]:
@@ -261,7 +312,7 @@ class TicketBot:
                     await self.submit(chat, sender)
                 elif data == "cancel":
                     await self.store.save_draft(uid, {})
-                    await self.tg.send(chat, "Отменено.", markup=MENU)
+                    await self.reply(chat, "Отменено.", markup=MENU)
                 elif data.startswith("reply:"):
                     answer = await self.start_reply(chat, sender, data.removeprefix("reply:"))
         finally:
@@ -333,13 +384,13 @@ class TicketBot:
     async def list_senders(self, chat: int) -> None:
         senders = [s for s in await self.store.senders() if s.approved]
         if not senders:
-            await self.tg.send(chat, "Одобренных сотрудников пока нет.")
+            await self.reply(chat, "Одобренных сотрудников пока нет.")
             return
         rows = [
             [(f"🔀 {clip(s.name, 40)} — {s.project_name}", f"mvl:{s.tg_user_id}")]
             for s in senders[:90]  # Telegram allows 100 buttons per message
         ]
-        await self.tg.send(
+        await self.reply(
             chat, "Сотрудники и их проекты. Нажмите, чтобы перевести в другой:", markup=inline(rows)
         )
 
@@ -357,7 +408,7 @@ class TicketBot:
         if not choices:
             return "Других проектов с доской «Заявки» нет"
         rows = [[(f"➡️ {label}", f"mv:{target}:{ref}")] for label, ref in choices]
-        await self.tg.send(
+        await self.reply(
             chat,
             f"Куда перевести <b>{esc(sender.name)}</b>? Сейчас: {esc(sender.project_name)}.\n"
             "Новые заявки пойдут в выбранный проект, отправленные останутся где были.",
@@ -399,13 +450,13 @@ class TicketBot:
 
     async def take_title(self, chat: int, uid: int, draft: dict, msg: dict, text: str) -> None:
         if not text or text.startswith("/"):
-            await self.tg.send(chat, "Сначала напишите заголовок текстом — одной строкой.")
+            await self.reply(chat, "Сначала напишите заголовок текстом — одной строкой.")
             return
         title = clip(" ".join(text.split()), MAX_TITLE)
         await self.store.save_draft(
             uid, {"step": "details", "title": title, "parts": [], "files": []}
         )
-        await self.tg.send(chat, ASK_DETAILS, markup=DRAFT_BUTTONS)
+        await self.reply(chat, ASK_DETAILS, markup=DRAFT_BUTTONS)
 
     async def take_details(self, chat: int, uid: int, draft: dict, msg: dict, text: str) -> None:
         caption = (msg.get("caption") or "").strip()
@@ -416,22 +467,22 @@ class TicketBot:
             notes.append("текст")
         if file:
             if file["size"] > MAX_DOWNLOAD:
-                await self.tg.send(
+                await self.reply(
                     chat, "Файл больше 20 МБ: бот такие не принимает. Пришлите ссылку."
                 )
                 return
             if len(draft["files"]) >= MAX_FILES:
-                await self.tg.send(chat, f"Не больше {MAX_FILES} файлов на заявку.")
+                await self.reply(chat, f"Не больше {MAX_FILES} файлов на заявку.")
                 return
             draft["files"].append(file)
             notes.append(f"файл {esc(file['name'])}")
         if not notes:
-            await self.tg.send(
+            await self.reply(
                 chat, "Такое сообщение бот не понимает: пришлите текст, фото или файл."
             )
             return
         await self.store.save_draft(uid, draft)
-        await self.tg.send(
+        await self.reply(
             chat,
             f"Добавлено: {', '.join(notes)}. Ещё что-то — или «Отправить».",
             markup=DRAFT_BUTTONS,
@@ -447,7 +498,7 @@ class TicketBot:
             desk = self.desks.get(account) if account else None
             project = await self.project_of(desk, sender) if desk else None
             if account is None or desk is None or project is None:
-                await self.tg.send(
+                await self.reply(
                     chat, "Не нашёл, куда отправить заявку: напишите администратору бота."
                 )
                 return
@@ -463,7 +514,7 @@ class TicketBot:
             except YouGileError as exc:
                 log.warning("cannot create a ticket in %s: %s", project.title, exc)
                 await self.store.save_draft(uid, draft)
-                await self.tg.send(
+                await self.reply(
                     chat,
                     "Не получилось создать заявку. Попробуйте «Отправить» ещё раз чуть позже.",
                     markup=DRAFT_BUTTONS,
@@ -482,6 +533,25 @@ class TicketBot:
                 last_message_id=now_ms(),
             )
             note = f"\n\nНе удалось приложить: {esc(', '.join(failed))}." if failed else ""
+            thread = await self.open_topic(chat, topic_name(number, title))
+            if thread:
+                await self.store.update_ticket(task["id"], tg_thread_id=thread)
+                thread = await self.say(
+                    chat,
+                    task["id"],
+                    f"✅ Заявка <b>{esc(number)}</b> принята: «{esc(title)}».\n"
+                    f"Здесь — всё по ней: статус, вопросы команды. Пишите сюда, "
+                    f"сообщения уйдут в заявку.{note}",
+                    thread=thread,
+                )
+            if thread:
+                await self.reply(
+                    chat,
+                    f"✅ Заявка <b>{esc(number)}</b> принята. Переписка по ней — в отдельной "
+                    f"теме «{esc(topic_name(number, title))}».",
+                    markup=MENU,
+                )
+                return
             await self.say(
                 chat,
                 task["id"],
@@ -489,7 +559,32 @@ class TicketBot:
                 f"Напишу, когда она сдвинется. Ответить по ней — кнопкой ниже "
                 f"или ответом на это сообщение.{note}",
             )
-            await self.tg.send(chat, "Что-то ещё?", markup=MENU)
+            await self.reply(chat, "Что-то ещё?", markup=MENU)
+
+    async def open_topic(self, chat: int, name: str) -> int | None:
+        """A topic for a ticket in the sender's chat, or None (topics off or refused)."""
+        if not await self.topics_enabled():
+            return None
+        try:
+            topic = await self.tg.call("createForumTopic", chat_id=chat, name=name)
+        except TelegramError as exc:
+            log.info("createForumTopic: %s", exc)
+            return None
+        thread = int((topic or {}).get("message_thread_id") or 0)
+        return thread or None
+
+    async def rename_topic(self, ticket: Ticket, name: str) -> None:
+        if not ticket.tg_thread_id:
+            return
+        try:
+            await self.tg.call(
+                "editForumTopic",
+                chat_id=ticket.tg_user_id,
+                message_thread_id=ticket.tg_thread_id,
+                name=name,
+            )
+        except TelegramError as exc:
+            log.info("editForumTopic for %s: %s", ticket.number, exc)
 
     async def project_of(self, desk: Desk, sender: Sender) -> Project | None:
         projects = await desk.projects()
@@ -514,7 +609,7 @@ class TicketBot:
         if ticket is None or ticket.tg_user_id != sender.tg_user_id:
             return "Заявка не найдена"
         await self.store.save_draft(sender.tg_user_id, {"step": "reply", "task_id": task_id})
-        await self.tg.send(chat, f"Напишите сообщение по заявке <b>{esc(ticket.number)}</b>:")
+        await self.reply(chat, f"Напишите сообщение по заявке <b>{esc(ticket.number)}</b>:")
         return None
 
     async def relay(self, sender: Sender, msg: dict, task_id: str) -> None:
@@ -522,7 +617,7 @@ class TicketBot:
         chat = msg["chat"]["id"]
         ticket = await self.store.ticket(task_id)
         if ticket is None or ticket.tg_user_id != sender.tg_user_id or ticket.deleted:
-            await self.tg.send(chat, "Эта заявка недоступна.", markup=MENU)
+            await self.reply(chat, "Эта заявка недоступна.", markup=MENU)
             return
         account = await self.store.account(ticket.account_id)
         assert account is not None
@@ -530,7 +625,7 @@ class TicketBot:
         text = (msg.get("text") or msg.get("caption") or "").strip()
         file = attachment(msg)
         if not text and not file:
-            await self.tg.send(chat, "Пришлите текст, фото или файл.")
+            await self.reply(chat, "Пришлите текст, фото или файл.")
             return
         header = f"{sender.name} ({sender.project_name}) пишет из Telegram:"
         try:
@@ -538,15 +633,20 @@ class TicketBot:
             failed = await self.upload(desk, task_id, [file]) if file else []
         except YouGileError as exc:
             log.warning("relaying to %s failed: %s", ticket.number, exc)
-            await self.tg.send(chat, "Не получилось передать сообщение. Попробуйте позже.")
+            await self.reply(chat, "Не получилось передать сообщение. Попробуйте позже.")
             return
         note = " Файл приложить не удалось." if failed else ""
-        await self.say(chat, task_id, f"Передал в заявку <b>{esc(ticket.number)}</b>.{note}")
+        await self.say(
+            chat,
+            task_id,
+            f"Передал в заявку <b>{esc(ticket.number)}</b>.{note}",
+            thread=_thread.get(),
+        )
 
     async def list_tickets(self, chat: int, uid: int) -> None:
         tickets = await self.store.tickets_of(uid)
         if not tickets:
-            await self.tg.send(chat, "Заявок пока нет.", markup=MENU)
+            await self.reply(chat, "Заявок пока нет.", markup=MENU)
             return
         lines = []
         for t in tickets:
@@ -555,16 +655,31 @@ class TicketBot:
         rows = [
             [(f"Ответить {t.number}", f"reply:{t.task_id}")] for t in tickets if not t.completed
         ]
-        await self.tg.send(
+        await self.reply(
             chat, "Ваши заявки:\n" + "\n".join(lines), markup=inline(rows[:8]) if rows else MENU
         )
 
-    async def say(self, chat: int, task_id: str, text: str) -> None:
-        """A message about a ticket, with a reply button; replies to it reach the ticket."""
-        sent = await self.tg.send(
-            chat, text, markup=inline([[("💬 Ответить", f"reply:{task_id}")]])
-        )
+    async def say(
+        self, chat: int, task_id: str, text: str, *, thread: int | None = None
+    ) -> int | None:
+        """A message about a ticket: into its topic, or into the main chat with a reply
+        button. A topic Telegram refuses is dropped for good, and the message goes to the main
+        chat. Returns the topic used, if any. Replies to the message reach the ticket."""
+        sent = None
+        if thread:
+            try:
+                sent = await self.tg.send(chat, text, thread=thread)
+            except TelegramError as exc:
+                if exc.code != 400:
+                    raise
+                log.info("the topic of %s is unusable (%s): main chat instead", task_id, exc)
+                await self.store.update_ticket(task_id, tg_thread_id=None)
+                thread = None
+        if sent is None:
+            button = inline([[("💬 Ответить", f"reply:{task_id}")]])
+            sent = await self.tg.send(chat, text, markup=button)
         await self.store.link_message(chat, sent["message_id"], task_id)
+        return thread
 
     # ================= YouGile side =================
 
@@ -619,6 +734,7 @@ class TicketBot:
                 await self.notify(
                     ticket, f"Заявка <b>{esc(ticket.number)}</b> «{esc(ticket.title)}» снята."
                 )
+                await self.rename_topic(ticket, topic_name(ticket.number, ticket.title, "✖ "))
                 return
             if column is None or column.project_id != ticket.project_id:
                 log.info("ticket %s is outside the customer's project: not reported", ticket.number)
@@ -635,6 +751,9 @@ class TicketBot:
         await self.store.update_ticket(
             ticket.task_id, column_id=column_id, completed=done, title=name
         )
+        if done != ticket.completed or name != ticket.title:
+            # A closed ticket's topic stays as its history, marked; writing there still works.
+            await self.rename_topic(ticket, topic_name(ticket.number, name, "✅ " if done else ""))
         if column_id == ticket.column_id and done == ticket.completed:
             return  # only the title changed
         head = f"<b>{esc(ticket.number)}</b> «{esc(name)}»"
@@ -665,6 +784,6 @@ class TicketBot:
 
     async def notify(self, ticket: Ticket, text: str) -> None:
         try:
-            await self.say(ticket.tg_user_id, ticket.task_id, text)
+            await self.say(ticket.tg_user_id, ticket.task_id, text, thread=ticket.tg_thread_id)
         except TelegramError as exc:  # the sender blocked the bot, say
             log.info("cannot notify about %s: %s", ticket.number, exc)

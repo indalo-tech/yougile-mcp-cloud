@@ -56,40 +56,19 @@ class Telegram:
         raise AssertionError("unreachable")
 
     async def send(
-        self,
-        chat_id: int,
-        text: str,
-        *,
-        markup: dict | None = None,
-        reply_to: int | None = None,
+        self, chat_id: int, text: str, *, markup: dict | None = None, thread: int | None = None
     ) -> dict:
-        """An HTML message; the caller escapes what came from people."""
+        """An HTML message, into a topic when ``thread`` is given; the caller escapes what
+        came from people."""
         return await self.call(
             "sendMessage",
             chat_id=chat_id,
+            message_thread_id=thread,
             text=text,
             parse_mode="HTML",
             link_preview_options={"is_disabled": True},
             reply_markup=markup,
-            reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True}
-            if reply_to
-            else None,
         )
-
-    async def send_document(
-        self, chat_id: int, filename: str, data: bytes, caption: str | None = None
-    ) -> dict:
-        fields = {"chat_id": str(chat_id)}
-        if caption:
-            fields |= {"caption": caption, "parse_mode": "HTML"}
-        resp = await self._post("sendDocument", data=fields, files={"document": (filename, data)})
-        payload = _json(resp)
-        if not payload.get("ok"):
-            raise TelegramError(
-                int(payload.get("error_code") or resp.status_code),
-                str(payload.get("description") or "error"),
-            )
-        return payload["result"]
 
     async def download(self, file_id: str) -> bytes:
         info = await self.call("getFile", file_id=file_id)
