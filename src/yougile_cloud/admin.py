@@ -32,6 +32,7 @@ from .permissions import denied_keys, deny_list, format_workflows, parse_workflo
 from .settings import Settings
 from .signin import SignIn, TooManyAttempts
 from .tenancy import Tenancy
+from .tickets.admin_page import TicketAdmin
 from .web import CRED_TTL, SECURITY_HEADERS, html, same_origin
 from .yougile_auth import BadCredentials, KeyLimitReached, YouGileAuth, YouGileCompany
 
@@ -149,6 +150,7 @@ class AdminPages:
         self.auth: YouGileAuth | None = None
         self.tenancy: Tenancy | None = None
         self.transport: Any = None
+        self.tickets = TicketAdmin(self)
 
     def attach(
         self,
@@ -175,6 +177,7 @@ class AdminPages:
             ("/admin/users/{user_id}", "POST", self.save_user),
             ("/admin/users/{user_id}/reset", "POST", self.reset_user),
             ("/admin/users/{user_id}/disconnect", "POST", self.disconnect_user),
+            *(self.tickets.routes() if self.settings.tickets_company_id else []),
         ]
 
     # ---------- plumbing ----------
@@ -237,6 +240,7 @@ class AdminPages:
             tz=ZoneInfo(_choice(s.get("timezone"), ui.timezones(), DEFAULT_TIMEZONE)),
             default_role=_choice(s.get("default_role"), ui.ROLES, "member"),
             company_denied=denied_keys(s.get("deny", [])),
+            tickets=session.company.id == self.settings.tickets_company_id,
         )
 
     async def _guarded(self, request: Request, handler: Handler, *, post: bool = False) -> Response:

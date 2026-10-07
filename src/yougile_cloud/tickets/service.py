@@ -1,6 +1,6 @@
 """The ticket bot's process: Telegram long polling, the YouGile webhook endpoint, a periodic
-check of open tickets. Without TICKETS_BOT_TOKEN it stays idle (and healthy), so the container
-can be deployed before the bot is configured."""
+check of open tickets. Without a token (admin page or TICKETS_BOT_TOKEN) it stays idle and
+healthy, so the container can be deployed before the bot is configured."""
 
 from __future__ import annotations
 
@@ -65,50 +65,98 @@ def hook_url(settings: Settings) -> str:
 
 
 class TicketService:
+    """Runs the bot with the token and approvers from the admin page (the ``ticket_bot`` row),
+    or from the environment when the page has none; re-reads them every WATCH_SECONDS."""
+
+    WATCH_SECONDS = 20
+
     def __init__(
         self,
         settings: Settings,
         tickets: TicketSettings,
         *,
         transport: Any = None,  # tests: a fake YouGile
-        tg: Telegram | None = None,  # tests: a Telegram with a fake transport
     ) -> None:
         self.settings = settings
         self.tickets = tickets
         self.transport = transport
-        self.tg = tg
         self.secret = hook_secret(settings.jwt_secret)
+        self.secrets = Secrets(settings.encryption_keys, settings.jwt_secret)
         self.db: Database | None = None
         self.kv: KV | None = None
+        self.store: TicketStore | None = None
         self.desks: Desks | None = None
+        self.tg: Telegram | None = None
         self.bot: TicketBot | None = None
+        self._token: str | None = None
+        self._poller: asyncio.Task | None = None
+        self._polling = True
         self._tasks: set[asyncio.Task] = set()
 
     async def start(self, *, use_kv: bool = True, poll: bool = True) -> None:
-        if not self.tickets.bot_token and self.tg is None:
-            log.warning("TICKETS_BOT_TOKEN is not set: the ticket bot is idle")
-            return
-        if not self.tickets.admins:
-            log.warning("TICKETS_ADMINS is empty: nobody can approve senders")
+        self._polling = poll
         self.db = Database(self.settings.database_url, max_size=5)
         await self.db.open()
         await self.db.migrate()
         self.kv = await KV.connect(self.settings.valkey_url) if use_kv else None
-        secrets = Secrets(self.settings.encryption_keys, self.settings.jwt_secret)
+        self.store = TicketStore(self.db)
         self.desks = Desks(
-            secrets,
+            self.secrets,
             self.settings.yougile_base_url,
             kv=self.kv,
             rate_limit=self.settings.rate_limit,
             transport=self.transport,
         )
-        self.tg = self.tg or Telegram(self.tickets.bot_token or "")
-        self.bot = TicketBot(self.tg, TicketStore(self.db), self.desks, self.tickets.admins)
+        await self.apply_config()
         if poll:
-            self._spawn(self._poll())
+            self._spawn(self._watch())
             self._spawn(self._reconcile())
 
+    async def config(self) -> tuple[str | None, frozenset[int]]:
+        """The token and the approvers: the admin page's, else the environment's."""
+        assert self.store
+        stored = await self.store.bot_config()
+        token = None
+        if stored and stored.token_enc:
+            try:
+                token = self.secrets.decrypt(stored.token_enc)
+            except ValueError:
+                log.error("the stored bot token cannot be decrypted with ENCRYPTION_KEYS")
+        admins = (stored.admins if stored else frozenset()) | self.tickets.admins
+        return token or self.tickets.bot_token, admins
+
+    async def apply_config(self) -> None:
+        """Start, restart (new token) or stop the bot; keep its approvers current."""
+        assert self.store and self.desks
+        token, admins = await self.config()
+        if token != self._token:
+            await self._stop_bot()
+            self._token = token
+            if token:
+                self.tg = Telegram(token)
+                self.bot = TicketBot(self.tg, self.store, self.desks, admins)
+                if self._polling:
+                    self._poller = self._spawn(self._poll(self.tg, self.bot))
+                log.info("the ticket bot is running")
+            else:
+                log.warning("no bot token (admin page or TICKETS_BOT_TOKEN): the bot is idle")
+        if self.bot is not None:
+            if not admins:
+                log.warning("nobody approves senders: add approvers on the admin page")
+            self.bot.admins = admins
+
+    async def _stop_bot(self) -> None:
+        if self._poller:
+            self._poller.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._poller
+            self._poller = None
+        if self.tg:
+            await self.tg.aclose()
+        self.tg = self.bot = None
+
     async def stop(self) -> None:
+        await self._stop_bot()
         for task in list(self._tasks):
             task.cancel()
         for task in list(self._tasks):
@@ -116,8 +164,6 @@ class TicketService:
                 await task
         if self.desks:
             await self.desks.close()
-        if self.tg:
-            await self.tg.aclose()
         if self.kv:
             await self.kv.close()
         if self.db:
@@ -129,14 +175,22 @@ class TicketService:
         task.add_done_callback(self._tasks.discard)
         return task
 
-    async def _poll(self) -> None:
-        assert self.tg and self.bot
+    async def _watch(self) -> None:
+        while True:
+            await asyncio.sleep(self.WATCH_SECONDS)
+            try:
+                await self.apply_config()
+            except Exception:
+                log.exception("re-reading the bot settings failed")
+
+    @staticmethod
+    async def _poll(tg: Telegram, bot: TicketBot) -> None:
         offset: int | None = None
         with contextlib.suppress(TelegramError):
-            await self.tg.call("deleteWebhook")  # long polling and a webhook exclude each other
+            await tg.call("deleteWebhook")  # long polling and a webhook exclude each other
         while True:
             try:
-                updates = await self.tg.updates(offset)
+                updates = await tg.updates(offset)
             except TelegramError as exc:
                 log.warning("getUpdates: %s", exc)
                 await asyncio.sleep(5)
@@ -144,15 +198,16 @@ class TicketService:
             for update in updates:
                 offset = update["update_id"] + 1
                 try:
-                    await self.bot.handle(update)
+                    await bot.handle(update)
                 except Exception:
                     log.exception("update %s failed", update.get("update_id"))
 
     async def _reconcile(self) -> None:
         """Webhooks can be lost: look at every open ticket now and then."""
-        assert self.bot
         while True:
             await asyncio.sleep(self.tickets.reconcile_seconds)
+            if self.bot is None:
+                continue
             try:
                 await self.bot.store.drop_stale_drafts()
                 await self.bot.refresh_open()
@@ -160,9 +215,11 @@ class TicketService:
                 log.exception("checking open tickets failed")
 
     async def _handle_event(self, event: dict) -> None:
-        assert self.bot
+        bot = self.bot
+        if bot is None:
+            return
         try:
-            await self.bot.on_event(event)
+            await bot.on_event(event)
         except Exception:
             log.exception("YouGile event %s failed", event.get("event"))
 

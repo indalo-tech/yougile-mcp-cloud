@@ -172,8 +172,8 @@ async def store():
     await db.open()
     await db.migrate()
     await db._exec(
-        "TRUNCATE ticket_drafts, ticket_tg_messages, tickets, ticket_senders, ticket_accounts "
-        "CASCADE"
+        "TRUNCATE ticket_bot, ticket_drafts, ticket_tg_messages, tickets, ticket_senders, "
+        "ticket_accounts CASCADE"
     )
     yield TicketStore(db)
     await db.close()
@@ -606,20 +606,46 @@ def request(secret: str, body: bytes) -> Request:
     return Request(scope, receive)
 
 
-async def test_hook_checks_its_secret():
-    settings = Settings(
+def service_settings() -> Settings:
+    return Settings(
         public_url="https://x.test",
         database_url=DB_URL,
         valkey_url="valkey://127.0.0.1:1",
         encryption_keys=[FERNET_KEY],
         jwt_secret="t" * 48,
     )
-    service = TicketService(settings, TicketSettings(None, frozenset()))
-    await service.start()  # no token: idle
-    assert service.bot is None
-    assert (await service.hook(request("wrong", b"{}"))).status_code == 404
-    assert (await service.hook(request(hook_secret("t" * 48), b"{}"))).status_code == 503
-    assert hook_secret("t" * 48) != hook_secret("u" * 48)
+
+
+async def test_hook_checks_its_secret(store):
+    service = TicketService(service_settings(), TicketSettings(None, frozenset()))
+    await service.start(use_kv=False, poll=False)  # no token anywhere: idle
+    try:
+        assert service.bot is None
+        assert (await service.hook(request("wrong", b"{}"))).status_code == 404
+        assert (await service.hook(request(hook_secret("t" * 48), b"{}"))).status_code == 503
+        assert hook_secret("t" * 48) != hook_secret("u" * 48)
+    finally:
+        await service.stop()
+
+
+async def test_the_service_takes_its_settings_from_the_admin_page(store):
+    service = TicketService(service_settings(), TicketSettings(None, frozenset({7})))
+    await service.start(use_kv=False, poll=False)
+    try:
+        assert service.bot is None
+        await store.save_bot_config(admins=[5], token_enc=SECRETS.encrypt("1:a"), bot_username="b")
+        await service.apply_config()
+        first = service.bot
+        assert first is not None and first.admins == {5, 7}  # the page's and the environment's
+        await store.save_bot_config(admins=[6])  # the token is kept: the same bot, new approvers
+        await service.apply_config()
+        assert service.bot is first and first.admins == {6, 7}
+        assert service.secrets.decrypt((await store.bot_config()).token_enc) == "1:a"
+        await store.save_bot_config(admins=[6], token_enc=SECRETS.encrypt("2:b"))
+        await service.apply_config()
+        assert service.bot is not None and service.bot is not first  # a new token: a new bot
+    finally:
+        await service.stop()
 
 
 def test_ids_in_payloads():

@@ -40,6 +40,7 @@ class Settings:
     admin_session_ttl: int = 12 * 3600
     host: str = "127.0.0.1"
     port: int = 8000
+    tickets_company_id: str | None = None  # the company whose admins set up the ticket bot
     extra: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -76,6 +77,7 @@ class Settings:
                 admin_session_ttl=int(env.get("ADMIN_SESSION_TTL", 12 * 3600)),
                 host=env.get("HOST", "127.0.0.1"),
                 port=int(env.get("PORT", 8000)),
+                tickets_company_id=(env.get("TICKETS_COMPANY_ID") or "").strip() or None,
             )
         except ValueError as exc:
             raise SettingsError(f"invalid number in settings: {exc}") from exc
