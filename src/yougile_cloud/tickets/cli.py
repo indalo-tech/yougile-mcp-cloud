@@ -1,4 +1,4 @@
-"""`yougile-cloud tickets …`: run the ticket bot and set up its customers (operator commands)."""
+"""`yougile-cloud tickets …`: run the ticket bot and set up its accounts (operator commands)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from ..crypto import Secrets
 from ..db import Database
 from ..settings import Settings, SettingsError
 from ..yougile_auth import BadCredentials, YouGileAuth
+from .desk import Desks
 from .service import WEBHOOK_EVENTS, hook_url
 from .store import TicketStore
 
@@ -54,6 +55,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         proxy_headers=False,
         log_level=os.environ.get("LOG_LEVEL", "info").lower(),
         server_header=False,
+        access_log=False,  # health checks every 15 s would drown the log
     )
 
 
@@ -75,73 +77,67 @@ async def _login(settings: Settings, what: str, company: str | None) -> tuple[st
     return key, companies[0].id
 
 
-def cmd_customer_add(args: argparse.Namespace) -> None:
+def cmd_account_add(args: argparse.Namespace) -> None:
     async def run(settings: Settings, store: TicketStore) -> None:
         key, company_id = await _login(settings, "учётки бота", args.company)
-        auth = YouGileAuth(settings.yougile_base_url)
-        me = await auth.me(key)
-        async with YouGileClient(key, settings.yougile_base_url) as client:
-            column = await client.request("GET", f"/columns/{args.column}")
-            board = await client.request("GET", f"/boards/{column['boardId']}")
-            project = await client.request("GET", f"/projects/{board['projectId']}")
+        me = await YouGileAuth(settings.yougile_base_url).me(key)
         secrets = Secrets(settings.encryption_keys, settings.jwt_secret)
-        customer = await store.add_customer(
+        account = await store.add_account(
             name=args.name,
             company_id=company_id,
-            project_id=project["id"],
-            column_id=args.column,
             bot_user_id=me.id,
             api_key_enc=secrets.encrypt(key),
         )
+        desk = Desks(secrets, settings.yougile_base_url, kv=None, rate_limit=settings.rate_limit)
+        try:
+            projects = await desk.get(account).projects()
+        finally:
+            await desk.close()
+        names = ", ".join(p.title for p in projects.values()) or "пока нет"
         print(
-            f"заказчик #{customer.id} «{customer.name}»: заявки идут в "
-            f"{project.get('title')} / {board.get('title')} / {column.get('title')}, "
-            f"бот пишет как {me.name or me.email}"
+            f"учётка #{account.id} «{account.name}»: бот пишет как {me.name or me.email}; "
+            f"проекты с доской «Заявки»: {names}"
         )
 
     _run(run)
 
 
-def cmd_customers(_args: argparse.Namespace) -> None:
+def cmd_accounts(_args: argparse.Namespace) -> None:
     async def run(_settings: Settings, store: TicketStore) -> None:
-        for c in await store.customers():
-            print(f"#{c.id}  {c.name}  company={c.company_id}  column={c.column_id}")
+        for a in await store.accounts():
+            print(f"#{a.id}  {a.name}  company={a.company_id}  bot_user={a.bot_user_id}")
 
     _run(run)
 
 
 def cmd_senders(_args: argparse.Namespace) -> None:
     async def run(_settings: Settings, store: TicketStore) -> None:
-        names = {c.id: c.name for c in await store.customers()}
         for s in await store.senders():
             who = f"@{s.username}" if s.username else ""
-            print(
-                f"{s.tg_user_id:<12} {s.status:<9} "
-                f"{names.get(s.customer_id or 0, '-'):<16} {s.name} {who}"
-            )
+            print(f"{s.tg_user_id:<12} {s.status:<9} {s.project_name or '-':<20} {s.name} {who}")
 
     _run(run)
 
 
 def cmd_block(args: argparse.Namespace) -> None:
     async def run(_settings: Settings, store: TicketStore) -> None:
-        sender = await store.decide(args.tg_user_id, "blocked", None, None)
+        sender = await store.decide(args.tg_user_id, "blocked", by=None)
         print("заблокирован" if sender else "нет такого отправителя")
 
     _run(run)
 
 
 def cmd_webhooks(args: argparse.Namespace) -> None:
-    """Subscribe the bot to YouGile events of each customer's company (idempotent)."""
+    """Subscribe the bot to YouGile events of each account's company (idempotent)."""
 
     async def run(settings: Settings, store: TicketStore) -> None:
         secrets = Secrets(settings.encryption_keys, settings.jwt_secret)
         url = hook_url(settings)
         companies: dict[str, bytes] = {}
-        for c in await store.customers():
-            companies.setdefault(c.company_id, c.api_key_enc)
+        for a in await store.accounts():
+            companies.setdefault(a.company_id, a.api_key_enc)
         if not companies:
-            sys.exit("сначала добавьте заказчика: yougile-cloud tickets customer-add")
+            sys.exit("сначала добавьте учётку бота: yougile-cloud tickets account-add")
         for company_id, key_enc in companies.items():
             temporary = None
             if args.admin:
@@ -191,12 +187,13 @@ def register(sub: Any) -> None:
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
     serve.set_defaults(func=cmd_serve)
-    add = cmds.add_parser("customer-add", help="add or update a customer (asks for a login)")
-    add.add_argument("name", help="the customer's name as approvers see it")
-    add.add_argument("--column", required=True, help="YouGile column id where tickets land")
+    add = cmds.add_parser(
+        "account-add", help="add the bot's YouGile account in a company (asks for its login)"
+    )
+    add.add_argument("name", help="a name for the account, e.g. the company's")
     add.add_argument("--company", help="YouGile company id or name, if the login has several")
-    add.set_defaults(func=cmd_customer_add)
-    cmds.add_parser("customers", help="list customers").set_defaults(func=cmd_customers)
+    add.set_defaults(func=cmd_account_add)
+    cmds.add_parser("accounts", help="list the bot's accounts").set_defaults(func=cmd_accounts)
     cmds.add_parser("senders", help="list senders and their status").set_defaults(func=cmd_senders)
     block = cmds.add_parser("block", help="block a sender")
     block.add_argument("tg_user_id", type=int)

@@ -76,7 +76,7 @@ docker compose exec postgres psql -U yougile yougile
 cd /home/deploy/yougile-mcp-cloud
 # в .env: TICKETS_BOT_TOKEN=<токен от @BotFather>, TICKETS_ADMINS=<telegram id через запятую>
 docker compose up -d tickets
-docker compose exec -it tickets yougile-cloud tickets customer-add "Подружки" --column <id>
+docker compose exec -it tickets yougile-cloud tickets account-add "Indalo"
 docker compose exec -it tickets yougile-cloud tickets webhooks      # или с --admin
 docker compose logs --tail 100 tickets
 ```

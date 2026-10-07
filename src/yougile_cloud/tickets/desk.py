@@ -1,4 +1,4 @@
-"""YouGile as one customer's bot account sees it: create tickets, read them, talk in their chats."""
+"""YouGile as the bot's account sees it: create tickets, read them, talk in their chats."""
 
 from __future__ import annotations
 
@@ -9,15 +9,25 @@ from dataclasses import dataclass
 from typing import Any
 
 from yougile_mcp.client import YouGileClient, YouGileError
+from yougile_mcp.directory import fetch_all
 from yougile_mcp.present import html_to_text
 from yougile_mcp.ratelimit import NoopRateLimiter
 from yougile_mcp.smart import FILE_MARK
 
 from ..crypto import Secrets
 from ..kv import KV, CompanyRateLimiter
-from .store import Customer
+from .store import Account
 
 CACHE_TTL = 600.0
+REQUESTS_BOARD = "заявки"  # a project takes tickets once it has a board with this name
+SKIP_COLUMNS = {"документы"}  # never the column a new ticket lands in
+
+
+@dataclass(frozen=True)
+class Project:
+    id: str
+    title: str
+    column_id: str  # where its new tickets land: «Очередь» on «Заявки», or its first column
 
 
 @dataclass(frozen=True)
@@ -44,22 +54,53 @@ def file_url(message: dict) -> str | None:
 
 
 class Desk:
-    def __init__(self, customer: Customer, client: YouGileClient, base_url: str) -> None:
-        self.customer = customer
+    def __init__(self, account: Account, client: YouGileClient, base_url: str) -> None:
+        self.account = account
         self.client = client
         self.base_url = base_url.rstrip("/")
         self._columns: dict[str, tuple[float, Column]] = {}
         self._users: dict[str, tuple[float, str]] = {}
+        self._projects: tuple[float, dict[str, Project]] | None = None
 
-    async def create_task(self, title: str, description_html: str) -> dict:
+    async def projects(self, *, fresh: bool = False) -> dict[str, Project]:
+        """Projects that take tickets (they have a «Заявки» board), by id."""
+        if self._projects and not fresh and time.monotonic() - self._projects[0] < CACHE_TTL:
+            return self._projects[1]
+        projects = await fetch_all(self.client, "/projects")
+        boards = await fetch_all(self.client, "/boards")
+        columns = await fetch_all(self.client, "/columns")
+        found: dict[str, Project] = {}
+        for p in projects:
+            if p.get("deleted"):
+                continue
+            board = next(
+                (
+                    b
+                    for b in boards
+                    if b.get("projectId") == p["id"]
+                    and not b.get("deleted")
+                    and (b.get("title") or "").strip().lower() == REQUESTS_BOARD
+                ),
+                None,
+            )
+            if board is None:
+                continue
+            own = [c for c in columns if c.get("boardId") == board["id"] and not c.get("deleted")]
+            usable = [c for c in own if (c.get("title") or "").strip().lower() not in SKIP_COLUMNS]
+            queue = next(
+                (c for c in usable if c.get("title", "").strip().lower() == "очередь"), None
+            )
+            column = queue or (usable[0] if usable else None)
+            if column:
+                found[p["id"]] = Project(p["id"], p.get("title") or p["id"], column["id"])
+        self._projects = (time.monotonic(), found)
+        return found
+
+    async def create_task(self, column_id: str, title: str, description_html: str) -> dict:
         created = await self.client.request(
             "POST",
             "/tasks",
-            json={
-                "title": title,
-                "columnId": self.customer.column_id,
-                "description": description_html,
-            },
+            json={"title": title, "columnId": column_id, "description": description_html},
         )
         return await self.client.request("GET", f"/tasks/{created['id']}")
 
@@ -123,7 +164,7 @@ class Desk:
 
 
 class Desks:
-    """One Desk per customer, sharing the company's rate limit with the MCP server."""
+    """One Desk per account, sharing the company's rate limit with the MCP server."""
 
     def __init__(
         self,
@@ -141,21 +182,21 @@ class Desks:
         self.transport = transport
         self._desks: dict[int, Desk] = {}
 
-    def get(self, customer: Customer) -> Desk:
-        desk = self._desks.get(customer.id)
-        if desk is None or desk.customer != customer:
+    def get(self, account: Account) -> Desk:
+        desk = self._desks.get(account.id)
+        if desk is None or desk.account != account:
             limiter = (
-                CompanyRateLimiter(self.kv, customer.company_id, self.rate_limit)
+                CompanyRateLimiter(self.kv, account.company_id, self.rate_limit)
                 if self.kv
                 else NoopRateLimiter()
             )
             client = YouGileClient(
-                self.secrets.decrypt(customer.api_key_enc),
+                self.secrets.decrypt(account.api_key_enc),
                 self.base_url,
                 limiter=limiter,
                 transport=self.transport,
             )
-            desk = self._desks[customer.id] = Desk(customer, client, self.base_url)
+            desk = self._desks[account.id] = Desk(account, client, self.base_url)
         return desk
 
     async def close(self) -> None:

@@ -12,12 +12,12 @@ from ..db import Database
 
 
 @dataclass(frozen=True)
-class Customer:
+class Account:
+    """The bot's account in a YouGile company: its customers are that company's projects."""
+
     id: int
     name: str
     company_id: str
-    project_id: str
-    column_id: str
     bot_user_id: str
     api_key_enc: bytes
 
@@ -25,20 +25,23 @@ class Customer:
 @dataclass(frozen=True)
 class Sender:
     tg_user_id: int
-    customer_id: int | None
+    account_id: int | None
+    project_id: str | None  # the customer: tickets land on this project's «Заявки» board
+    project_name: str
     name: str
     username: str
     status: str
 
     @property
     def approved(self) -> bool:
-        return self.status == "approved" and self.customer_id is not None
+        return self.status == "approved" and bool(self.account_id and self.project_id)
 
 
 @dataclass(frozen=True)
 class Ticket:
     task_id: str
-    customer_id: int
+    account_id: int
+    project_id: str
     tg_user_id: int
     number: str
     title: str
@@ -49,13 +52,11 @@ class Ticket:
     created_at: datetime
 
 
-def _customer(row: dict) -> Customer:
-    return Customer(
+def _account(row: dict) -> Account:
+    return Account(
         id=row["id"],
         name=row["name"],
         company_id=row["company_id"],
-        project_id=row["project_id"],
-        column_id=row["column_id"],
         bot_user_id=row["bot_user_id"],
         api_key_enc=bytes(row["api_key_enc"]),
     )
@@ -64,7 +65,9 @@ def _customer(row: dict) -> Customer:
 def _sender(row: dict) -> Sender:
     return Sender(
         tg_user_id=row["tg_user_id"],
-        customer_id=row["customer_id"],
+        account_id=row["account_id"],
+        project_id=row["project_id"],
+        project_name=row["project_name"],
         name=row["name"],
         username=row["username"],
         status=row["status"],
@@ -79,42 +82,33 @@ class TicketStore:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    # ---------- customers ----------
+    # ---------- accounts ----------
 
-    async def add_customer(
-        self,
-        *,
-        name: str,
-        company_id: str,
-        project_id: str,
-        column_id: str,
-        bot_user_id: str,
-        api_key_enc: bytes,
-    ) -> Customer:
-        """Create a customer or replace the settings of the one with this name."""
+    async def add_account(
+        self, *, name: str, company_id: str, bot_user_id: str, api_key_enc: bytes
+    ) -> Account:
+        """Create an account or replace the key of the one with this name."""
         row = await self.db._one(
             """
-            INSERT INTO ticket_customers
-                (name, company_id, project_id, column_id, bot_user_id, api_key_enc)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO ticket_accounts (name, company_id, bot_user_id, api_key_enc)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (name) DO UPDATE SET
-                company_id = EXCLUDED.company_id, project_id = EXCLUDED.project_id,
-                column_id = EXCLUDED.column_id, bot_user_id = EXCLUDED.bot_user_id,
+                company_id = EXCLUDED.company_id, bot_user_id = EXCLUDED.bot_user_id,
                 api_key_enc = EXCLUDED.api_key_enc
             RETURNING *
             """,
-            (name, company_id, project_id, column_id, bot_user_id, api_key_enc),
+            (name, company_id, bot_user_id, api_key_enc),
         )
         assert row is not None
-        return _customer(row)
+        return _account(row)
 
-    async def customers(self) -> list[Customer]:
-        rows = await self.db._all("SELECT * FROM ticket_customers ORDER BY id")
-        return [_customer(r) for r in rows]
+    async def accounts(self) -> list[Account]:
+        rows = await self.db._all("SELECT * FROM ticket_accounts ORDER BY id")
+        return [_account(r) for r in rows]
 
-    async def customer(self, customer_id: int) -> Customer | None:
-        row = await self.db._one("SELECT * FROM ticket_customers WHERE id = %s", (customer_id,))
-        return _customer(row) if row else None
+    async def account(self, account_id: int) -> Account | None:
+        row = await self.db._one("SELECT * FROM ticket_accounts WHERE id = %s", (account_id,))
+        return _account(row) if row else None
 
     # ---------- senders ----------
 
@@ -141,15 +135,26 @@ class TicketStore:
         return _sender(row)
 
     async def decide(
-        self, tg_user_id: int, status: str, customer_id: int | None, by: int | None
+        self,
+        tg_user_id: int,
+        status: str,
+        *,
+        by: int | None,
+        account_id: int | None = None,
+        project_id: str | None = None,
+        project_name: str = "",
     ) -> Sender | None:
+        """Approve (binding the sender to a project), reject or block."""
         row = await self.db._one(
             """
-            UPDATE ticket_senders SET status = %s, customer_id = COALESCE(%s, customer_id),
+            UPDATE ticket_senders SET status = %s,
+                account_id = COALESCE(%s, account_id),
+                project_id = COALESCE(%s, project_id),
+                project_name = CASE WHEN %s::text IS NULL THEN project_name ELSE %s END,
                 decided_at = now(), decided_by = %s
             WHERE tg_user_id = %s RETURNING *
             """,
-            (status, customer_id, by, tg_user_id),
+            (status, account_id, project_id, project_id, project_name, by, tg_user_id),
         )
         return _sender(row) if row else None
 
@@ -163,7 +168,8 @@ class TicketStore:
         self,
         *,
         task_id: str,
-        customer_id: int,
+        account_id: int,
+        project_id: str,
         tg_user_id: int,
         number: str,
         title: str,
@@ -172,11 +178,20 @@ class TicketStore:
     ) -> Ticket:
         row = await self.db._one(
             """
-            INSERT INTO tickets
-                (task_id, customer_id, tg_user_id, number, title, column_id, last_message_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *
+            INSERT INTO tickets (task_id, account_id, project_id, tg_user_id, number, title,
+                                 column_id, last_message_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
             """,
-            (task_id, customer_id, tg_user_id, number, title, column_id, last_message_id),
+            (
+                task_id,
+                account_id,
+                project_id,
+                tg_user_id,
+                number,
+                title,
+                column_id,
+                last_message_id,
+            ),
         )
         assert row is not None
         return _ticket(row)

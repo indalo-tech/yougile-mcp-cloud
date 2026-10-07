@@ -57,13 +57,22 @@ class FakeYouGile:
     """Two projects: the client's «Работы» and an internal one the bot must never report."""
 
     def __init__(self) -> None:
-        self.columns = {
+        self.projects = {"p-client": "Работы", "p-other": "Клиент Б", "p-internal": "Внутреннее"}
+        self.boards = {  # id: (title, project)
+            "b-req": ("Заявки", "p-client"),
+            "b-hub": ("Хаб", "p-client"),
+            "b-other": ("заявки", "p-other"),
+            "b-int": ("Хаб", "p-internal"),
+        }
+        self.columns = {  # id: (title, board), in screen order
+            "c-docs": ("Документы", "b-req"),
             "c-queue": ("Очередь", "b-req"),
             "c-work": ("В работе", "b-req"),
             "c-done": ("Готово", "b-req"),
+            "c-hub": ("В работе", "b-hub"),
+            "c-new": ("Новые", "b-other"),
             "c-internal": ("В работе", "b-int"),
         }
-        self.boards = {"b-req": "p-client", "b-int": "p-internal"}
         self.tasks: dict[str, dict] = {}
         self.chats: dict[str, list[dict]] = {}
         self.uploads: list[str] = []
@@ -94,11 +103,23 @@ class FakeYouGile:
                 return httpx2.Response(400, json={"message": "broken"})
             task = self.tasks.get(m[1])
             return httpx2.Response(200, json=task) if task else httpx2.Response(404, json={})
+        if path in ("/projects", "/boards", "/columns"):
+            items = {
+                "/projects": [{"id": k, "title": v} for k, v in self.projects.items()],
+                "/boards": [
+                    {"id": k, "title": t, "projectId": p} for k, (t, p) in self.boards.items()
+                ],
+                "/columns": [
+                    {"id": k, "title": t, "boardId": b} for k, (t, b) in self.columns.items()
+                ],
+            }[path]
+            return httpx2.Response(200, json={"paging": {"next": False}, "content": items})
         if m := re.fullmatch(r"/columns/([\w-]+)", path):
             title, board = self.columns[m[1]]
             return httpx2.Response(200, json={"id": m[1], "title": title, "boardId": board})
         if m := re.fullmatch(r"/boards/([\w-]+)", path):
-            return httpx2.Response(200, json={"id": m[1], "projectId": self.boards[m[1]]})
+            title, project = self.boards[m[1]]
+            return httpx2.Response(200, json={"id": m[1], "title": title, "projectId": project})
         if m := re.fullmatch(r"/users/([\w-]+)", path):
             return httpx2.Response(200, json={"id": m[1], "realName": "Ованес"})
         if path == "/upload-file":
@@ -122,7 +143,7 @@ async def store():
     await db.open()
     await db.migrate()
     await db._exec(
-        "TRUNCATE ticket_drafts, ticket_tg_messages, tickets, ticket_senders, ticket_customers "
+        "TRUNCATE ticket_drafts, ticket_tg_messages, tickets, ticket_senders, ticket_accounts "
         "CASCADE"
     )
     yield TicketStore(db)
@@ -150,14 +171,9 @@ async def bot(store, tg, yg):
     await telegram.aclose()
 
 
-async def customer(store: TicketStore):
-    return await store.add_customer(
-        name="Подружки",
-        company_id="c-1",
-        project_id="p-client",
-        column_id="c-queue",
-        bot_user_id="u-bot",
-        api_key_enc=SECRETS.encrypt("key-1"),
+async def account(store: TicketStore):
+    return await store.add_account(
+        name="Indalo", company_id="c-1", bot_user_id="u-bot", api_key_enc=SECRETS.encrypt("k")
     )
 
 
@@ -204,12 +220,12 @@ def buttons(message: dict) -> list[str]:
     return [b["callback_data"] for row in rows for b in row]
 
 
-async def approved(bot, store, tg) -> int:  # noqa: ANN001
-    c = await customer(store)
+async def approved(bot, store, tg, project: str = "p-client") -> int:  # noqa: ANN001
+    a = await account(store)
     await bot.handle(text(ANNA, "/start"))
     await bot.handle(text(ANNA, "Анна, администратор, Подружки"))
-    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{c.id}"))
-    return c.id
+    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{a.id}:{project}"))
+    return a.id
 
 
 async def ticket(bot, tg) -> str:  # noqa: ANN001
@@ -225,34 +241,42 @@ async def ticket(bot, tg) -> str:  # noqa: ANN001
 
 
 async def test_access_needs_an_approver(bot, store, tg):
-    c = await customer(store)
+    a = await account(store)
     await bot.handle(text(ANNA, NEW))  # not approved: asked who they are
     assert "Как вас зовут" in tg.to(ANNA)[-1]
     await bot.handle(text(ANNA, "Анна, Подружки"))
     assert (await store.sender(ANNA)).status == "pending"
     request = [m for m in tg.sent if m["chat_id"] == ADMIN][-1]
     assert "Анна, Подружки" in request["text"] and "@anna" in request["text"]
-    assert buttons(request) == [f"ok:{ANNA}:{c.id}", f"no:{ANNA}"]
+    # Projects with a «Заявки» board, by name; the internal one has none.
+    assert buttons(request) == [
+        f"ok:{ANNA}:{a.id}:p-other",
+        f"ok:{ANNA}:{a.id}:p-client",
+        f"no:{ANNA}",
+    ]
 
-    await bot.handle(tap(EVE, f"ok:{ANNA}:{c.id}"))  # not an approver
+    await bot.handle(tap(EVE, f"ok:{ANNA}:{a.id}:p-client"))  # not an approver
     assert (await store.sender(ANNA)).status == "pending"
     await bot.handle(text(ANNA, NEW))
     assert "рассматривается" in tg.to(ANNA)[-1]
 
-    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{c.id}"))
+    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{a.id}:p-internal"))  # no «Заявки» there
+    assert (await store.sender(ANNA)).status == "pending"
+    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{a.id}:p-client"))
     sender = await store.sender(ANNA)
-    assert sender.approved and sender.customer_id == c.id
+    assert sender.approved and sender.project_id == "p-client"
+    assert sender.project_name == "Работы"
     assert "Доступ открыт" in tg.to(ANNA)[-1]
 
 
 async def test_rejected_and_blocked(bot, store, tg):
-    await customer(store)
+    await account(store)
     await bot.handle(text(EVE, "/start"))
     await bot.handle(text(EVE, "Ева"))
     await bot.handle(tap(ADMIN, f"no:{EVE}"))
     assert (await store.sender(EVE)).status == "rejected"
     assert "отказано" in tg.to(EVE)[-1]
-    await store.decide(EVE, "blocked", None, None)
+    await store.decide(EVE, "blocked", by=None)
     before = len(tg.sent)
     await bot.handle(text(EVE, "/start"))
     assert len(tg.sent) == before  # silence
@@ -261,7 +285,7 @@ async def test_rejected_and_blocked(bot, store, tg):
 # ---------------- tickets ----------------
 
 
-async def test_ticket_lands_in_the_customers_column(bot, store, tg, yg):
+async def test_ticket_lands_in_the_queue_of_the_senders_project(bot, store, tg, yg):
     await approved(bot, store, tg)
     await ticket(bot, tg)
     task = yg.tasks["t-1"]
@@ -269,7 +293,7 @@ async def test_ticket_lands_in_the_customers_column(bot, store, tg, yg):
     assert task["columnId"] == "c-queue"
     assert "&lt;b&gt;не&lt;/b&gt;" in task["description"]  # people's text is escaped
     assert "<p>Номер 89001112233</p>" in task["description"]
-    assert "Анна, администратор, Подружки (Подружки), Telegram @anna" in task["description"]
+    assert "Анна, администратор, Подружки (Работы), Telegram @anna" in task["description"]
     assert "скрин" in task["description"]
     assert len(yg.uploads) == 1 and "PHOTO-BYTES" in yg.uploads[0]
     assert yg.chats["t-1"][-1]["text"] == FILE_MARK + "/user-data/x/photo.jpg"
@@ -305,6 +329,26 @@ async def test_column_changes_and_team_messages_are_reported(bot, store, tg, yg)
     await bot.refresh("t-1")
     assert "✅ Заявка <b>ID-1</b>" in tg.to(ANNA)[-1]
     assert (await store.ticket("t-1")).completed
+
+
+async def test_each_sender_writes_to_their_own_project(bot, store, tg, yg):
+    await approved(bot, store, tg, project="p-other")
+    await ticket(bot, tg)
+    task = yg.tasks["t-1"]
+    assert task["columnId"] == "c-new"  # no «Очередь» there: the first column
+    assert "(Клиент Б)" in task["description"]
+    assert (await store.ticket("t-1")).project_id == "p-other"
+    yg.tasks["t-1"]["columnId"] = "c-queue"  # into another client's project: silence
+    await bot.refresh("t-1")
+    assert "Очередь" not in tg.to(ANNA)[-1]
+
+
+async def test_a_ticket_moved_to_another_board_of_its_project_is_still_reported(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    yg.tasks["t-1"]["columnId"] = "c-hub"
+    await bot.refresh("t-1")
+    assert tg.to(ANNA)[-1].endswith("В работе.")
 
 
 async def test_a_task_moved_out_of_the_clients_project_is_never_reported(bot, store, tg, yg):
@@ -377,8 +421,7 @@ async def test_replies_go_to_the_tickets_chat(bot, store, tg, yg):
     posted = yg.chats["t-1"][-1]
     assert posted["fromUserId"] == "u-bot"
     assert (
-        posted["text"]
-        == "Анна, администратор, Подружки (Подружки) пишет из Telegram:\nУже работает"
+        posted["text"] == "Анна, администратор, Подружки (Работы) пишет из Telegram:\nУже работает"
     )
 
     await bot.handle(tap(ANNA, "reply:t-1"))
@@ -391,10 +434,12 @@ async def test_replies_go_to_the_tickets_chat(bot, store, tg, yg):
 
 
 async def test_someone_elses_ticket_is_out_of_reach(bot, store, tg, yg):
-    c = await approved(bot, store, tg)
+    a = await approved(bot, store, tg)
     await ticket(bot, tg)
     await store.request_access(EVE, "Ева", "")
-    await store.decide(EVE, "approved", c, ADMIN)
+    await store.decide(
+        EVE, "approved", by=ADMIN, account_id=a, project_id="p-client", project_name="Работы"
+    )
     await bot.handle(tap(EVE, "reply:t-1"))
     await bot.handle(text(EVE, "чужая"))
     assert all("чужая" not in m["text"] for m in yg.chats["t-1"])

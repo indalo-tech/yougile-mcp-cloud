@@ -11,8 +11,8 @@ from typing import Any
 
 from yougile_mcp.client import YouGileError
 
-from .desk import Desk, Desks, file_url, message_text, text_html
-from .store import Customer, Sender, Ticket, TicketStore
+from .desk import Desk, Desks, Project, file_url, message_text, text_html
+from .store import Account, Sender, Ticket, TicketStore
 from .telegram import MAX_DOWNLOAD, Telegram, TelegramError, inline
 
 log = logging.getLogger(__name__)
@@ -200,17 +200,34 @@ class TicketBot:
         await self.tg.send(chat, "Спасибо! Запрос на доступ отправлен. Напишу, когда его одобрят.")
         await self.ask_approvers(sender, user)
 
+    async def choices(self) -> list[tuple[str, str]]:
+        """Approval buttons: one per project with a «Заявки» board, in every account."""
+        accounts = await self.store.accounts()
+        buttons: list[tuple[str, str]] = []
+        for account in accounts:
+            try:
+                projects = await self.desks.get(account).projects(fresh=True)
+            except YouGileError as exc:
+                log.warning("cannot list projects of %s: %s", account.name, exc)
+                continue
+            for p in sorted(projects.values(), key=lambda p: p.title.lower()):
+                label = f"{account.name} / {p.title}" if len(accounts) > 1 else p.title
+                buttons.append((label, f"{account.id}:{p.id}"))
+        return buttons
+
     async def ask_approvers(self, sender: Sender, user: dict) -> None:
-        customers = await self.store.customers()
         who = esc(sender.name)
         tg_name = esc(" ".join(filter(None, [user.get("first_name"), user.get("last_name")])))
         handle = f" @{esc(sender.username)}" if sender.username else ""
         text = (
             f"Запрос доступа к заявкам:\n<b>{who}</b>\n"
             f"Telegram: {tg_name}{handle} (id <code>{sender.tg_user_id}</code>)\n\n"
-            "От какой компании он(а)?"
+            "В какой проект пойдут его (её) заявки? Они попадут на доску «Заявки» проекта."
         )
-        rows = [[(f"✅ {c.name}", f"ok:{sender.tg_user_id}:{c.id}")] for c in customers]
+        choices = await self.choices()
+        if not choices:
+            text += "\n\n⚠️ Ни в одном проекте нет доски «Заявки»: заведите её и нажмите снова."
+        rows = [[(f"✅ {label}", f"ok:{sender.tg_user_id}:{ref}")] for label, ref in choices]
         rows.append([("❌ Отклонить", f"no:{sender.tg_user_id}")])
         for admin in self.admins:
             try:
@@ -249,17 +266,27 @@ class TicketBot:
             return "Только для администраторов"
         parts = data.split(":")
         target = int(parts[1])
-        customer = None
         if parts[0] == "ok":
-            customer = await self.store.customer(int(parts[2]))
-            if customer is None:
-                return "Компания не найдена"
-        sender = await self.store.decide(
-            target, "approved" if customer else "rejected", customer.id if customer else None, uid
-        )
+            account = await self.store.account(int(parts[2]))
+            projects = await self.desks.get(account).projects(fresh=True) if account else {}
+            project = projects.get(parts[3]) if len(parts) > 3 else None
+            if account is None or project is None:
+                return "Проект не найден или в нём больше нет доски «Заявки»"
+            sender = await self.store.decide(
+                target,
+                "approved",
+                by=uid,
+                account_id=account.id,
+                project_id=project.id,
+                project_name=project.title,
+            )
+            verdict = f"✅ Одобрено, проект: {project.title}"  # plain text
+        else:
+            project = None
+            sender = await self.store.decide(target, "rejected", by=uid)
+            verdict = "❌ Отклонено"
         if sender is None:
             return "Запрос не найден"
-        verdict = f"✅ Одобрено: {customer.name}" if customer else "❌ Отклонено"  # plain text
         if msg.get("message_id"):
             try:
                 await self.tg.call(
@@ -271,7 +298,7 @@ class TicketBot:
             except TelegramError as exc:
                 log.info("editMessageText: %s", exc)
         try:
-            if customer:
+            if project:
                 await self.tg.send(
                     target, f"Доступ открыт. Теперь можно отправлять заявки.\n\n{HELP}", markup=MENU
                 )
@@ -327,22 +354,25 @@ class TicketBot:
             draft = await self.store.draft(uid)
             if draft.get("step") != "details":
                 return  # sent already (a second tap) or cancelled
-            customer = await self.store.customer(sender.customer_id or 0)
-            if customer is None:
-                await self.tg.send(chat, "Компания не настроена: напишите администратору.")
+            account = await self.store.account(sender.account_id or 0)
+            desk = self.desks.get(account) if account else None
+            project = await self.project_of(desk, sender) if desk else None
+            if account is None or desk is None or project is None:
+                await self.tg.send(
+                    chat, "Не нашёл, куда отправить заявку: напишите администратору бота."
+                )
                 return
             await self.store.save_draft(uid, {})
-            desk = self.desks.get(customer)
             title = draft["title"]
             body = "\n\n".join(draft.get("parts") or []) or title
-            signature = f"{sender.name} ({customer.name})" + (
+            signature = f"{sender.name} ({sender.project_name})" + (
                 f", Telegram @{sender.username}" if sender.username else ", Telegram"
             )
             description = text_html(body) + f"<p><i>Заявка из Telegram: {esc(signature)}</i></p>"
             try:
-                task = await desk.create_task(title, description)
+                task = await desk.create_task(project.column_id, title, description)
             except YouGileError as exc:
-                log.warning("cannot create a ticket for %s: %s", customer.name, exc)
+                log.warning("cannot create a ticket in %s: %s", project.title, exc)
                 await self.store.save_draft(uid, draft)
                 await self.tg.send(
                     chat,
@@ -354,11 +384,12 @@ class TicketBot:
             number = task.get("idTaskCommon") or task["id"]
             await self.store.add_ticket(
                 task_id=task["id"],
-                customer_id=customer.id,
+                account_id=account.id,
+                project_id=project.id,
                 tg_user_id=uid,
                 number=number,
                 title=title,
-                column_id=task.get("columnId") or customer.column_id,
+                column_id=task.get("columnId") or project.column_id,
                 last_message_id=now_ms(),
             )
             note = f"\n\nНе удалось приложить: {esc(', '.join(failed))}." if failed else ""
@@ -370,6 +401,12 @@ class TicketBot:
                 f"или ответом на это сообщение.{note}",
             )
             await self.tg.send(chat, "Что-то ещё?", markup=MENU)
+
+    async def project_of(self, desk: Desk, sender: Sender) -> Project | None:
+        projects = await desk.projects()
+        if sender.project_id not in projects:  # a board renamed or added a minute ago
+            projects = await desk.projects(fresh=True)
+        return projects.get(sender.project_id or "")
 
     async def upload(self, desk: Desk, task_id: str, files: list[dict]) -> list[str]:
         """Attach Telegram files to the ticket's chat; returns the names that failed."""
@@ -398,15 +435,15 @@ class TicketBot:
         if ticket is None or ticket.tg_user_id != sender.tg_user_id or ticket.deleted:
             await self.tg.send(chat, "Эта заявка недоступна.", markup=MENU)
             return
-        customer = await self.store.customer(ticket.customer_id)
-        assert customer is not None
-        desk = self.desks.get(customer)
+        account = await self.store.account(ticket.account_id)
+        assert account is not None
+        desk = self.desks.get(account)
         text = (msg.get("text") or msg.get("caption") or "").strip()
         file = attachment(msg)
         if not text and not file:
             await self.tg.send(chat, "Пришлите текст, фото или файл.")
             return
-        header = f"{sender.name} ({customer.name}) пишет из Telegram:"
+        header = f"{sender.name} ({sender.project_name}) пишет из Telegram:"
         try:
             await desk.post(task_id, f"{header}\n{text}" if text else f"{header} файл")
             failed = await self.upload(desk, task_id, [file]) if file else []
@@ -474,9 +511,9 @@ class TicketBot:
             ticket = await self.store.ticket(task_id)
             if ticket is None or ticket.deleted:
                 return
-            customer = await self.store.customer(ticket.customer_id)
-            assert customer is not None
-            desk = self.desks.get(customer)
+            account = await self.store.account(ticket.account_id)
+            assert account is not None
+            desk = self.desks.get(account)
             try:
                 task = await desk.task(task_id)
                 column_id = task.get("columnId")
@@ -494,12 +531,12 @@ class TicketBot:
                     ticket, f"Заявка <b>{esc(ticket.number)}</b> «{esc(ticket.title)}» снята."
                 )
                 return
-            if column is None or column.project_id != customer.project_id:
+            if column is None or column.project_id != ticket.project_id:
                 log.info("ticket %s is outside the customer's project: not reported", ticket.number)
                 return
             await self.report_status(ticket, task, column.id, column.title)
             if chat:
-                await self.report_messages(ticket, customer, desk)
+                await self.report_messages(ticket, account, desk)
 
     async def report_status(self, ticket: Ticket, task: dict, column_id: str, title: str) -> None:
         done = is_done(task, title)
@@ -515,14 +552,14 @@ class TicketBot:
         text = f"✅ Заявка {head} выполнена." if done else f"🔄 Заявка {head}: {esc(title)}."
         await self.notify(ticket, text)
 
-    async def report_messages(self, ticket: Ticket, customer: Customer, desk: Desk) -> None:
+    async def report_messages(self, ticket: Ticket, account: Account, desk: Desk) -> None:
         messages = await desk.messages_since(ticket.task_id, ticket.last_message_id)
         if not messages:
             return
         newest = ticket.last_message_id
         for m in messages:
             newest = max(newest, int(m["id"]))
-            if m.get("deleted") or m.get("fromUserId") == customer.bot_user_id:
+            if m.get("deleted") or m.get("fromUserId") == account.bot_user_id:
                 continue
             author = esc(await desk.user_name(m.get("fromUserId") or ""))
             url = file_url(m)
