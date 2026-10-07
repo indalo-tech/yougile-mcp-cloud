@@ -49,6 +49,18 @@ yougile.indalo.ru {
 		reverse_proxy 127.0.0.1:8100
 	}
 
+	# YouGile webhooks for the Telegram ticket bot (the path carries a secret).
+	handle /tickets/hook/* {
+		rate_limit {
+			zone ygc_hooks {
+				key {client_ip}
+				events 600
+				window 1m
+			}
+		}
+		reverse_proxy 127.0.0.1:8101
+	}
+
 	# Sign-in and admin pages, OAuth metadata, health.
 	handle {
 		reverse_proxy 127.0.0.1:8100

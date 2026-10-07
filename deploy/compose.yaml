@@ -42,6 +42,35 @@ services:
     logging: *logging
     networks: [yougile]
 
+  # The Telegram ticket bot: the same image, another command. Long-polls Telegram and takes
+  # YouGile webhooks at /tickets/hook/… (Caddy proxies that path here). Without
+  # TICKETS_BOT_TOKEN in .env it idles, healthy.
+  tickets:
+    image: ghcr.io/indalo-tech/yougile-mcp-cloud:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    command: ["yougile-cloud", "tickets", "serve"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://yougile:${POSTGRES_PASSWORD:?}@postgres:5432/yougile
+      VALKEY_URL: valkey://:${VALKEY_PASSWORD:?}@valkey:6379/0
+      HOST: 0.0.0.0
+      PORT: "8000"
+    ports:
+      - "127.0.0.1:${TICKETS_PORT:-8101}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+    networks: [yougile]
+
   postgres:
     image: postgres:18-alpine
     environment:

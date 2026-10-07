@@ -14,6 +14,7 @@ from .access import access_of
 from .crypto import new_fernet_key, new_token
 from .db import Database
 from .settings import Settings, SettingsError
+from .tickets import cli as tickets_cli
 
 
 def _settings() -> Settings:
@@ -127,6 +128,7 @@ def main(argv: list[str] | None = None) -> None:
     company.add_argument("--trial-days", type=int, help="(re)start a trial of N days from now")
     company.add_argument("--paid-until", help="YYYY-MM-DD: paid access until this date")
     company.set_defaults(func=cmd_company)
+    tickets_cli.register(sub)
 
     args = parser.parse_args(argv)
     args.func(args)

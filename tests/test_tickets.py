@@ -1,0 +1,451 @@
+"""The Telegram ticket bot against a fake Telegram, a fake YouGile and the real Postgres."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+
+import httpx2
+import pytest
+from conftest import DB_URL, FERNET_KEY, _reachable
+from starlette.requests import Request
+
+from yougile_cloud.crypto import Secrets
+from yougile_cloud.db import Database
+from yougile_cloud.settings import Settings
+from yougile_cloud.tickets.bot import MINE, NEW, TicketBot, attachment, ids_in
+from yougile_cloud.tickets.desk import Desks, text_html
+from yougile_cloud.tickets.service import TicketService, TicketSettings, hook_secret
+from yougile_cloud.tickets.store import TicketStore
+from yougile_cloud.tickets.telegram import Telegram
+
+PG_UP = "TEST_DATABASE_URL" in os.environ or _reachable("127.0.0.1", 55432)
+ADMIN, ANNA, EVE = 1, 100, 200
+SECRETS = Secrets([FERNET_KEY], "t" * 48)
+FILE_MARK = "/root/#file:"
+
+
+class FakeTelegram:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []  # sendMessage / sendDocument bodies
+        self.calls: list[str] = []
+        self.next_id = 1000
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        path = request.url.path
+        if "/file/bot" in path:
+            return httpx2.Response(200, content=b"PHOTO-BYTES")
+        method = path.rsplit("/", 1)[-1]
+        self.calls.append(method)
+        body = json.loads(request.content) if request.content else {}
+        result: Any = True
+        if method == "sendMessage":
+            self.next_id += 1
+            self.sent.append(body)
+            result = {"message_id": self.next_id, "chat": {"id": body["chat_id"]}}
+        elif method == "getFile":
+            result = {"file_id": body["file_id"], "file_path": f"photos/{body['file_id']}.jpg"}
+        return httpx2.Response(200, json={"ok": True, "result": result})
+
+    def to(self, chat: int) -> list[str]:
+        return [m["text"] for m in self.sent if m["chat_id"] == chat]
+
+
+class FakeYouGile:
+    """Two projects: the client's «Работы» and an internal one the bot must never report."""
+
+    def __init__(self) -> None:
+        self.columns = {
+            "c-queue": ("Очередь", "b-req"),
+            "c-work": ("В работе", "b-req"),
+            "c-done": ("Готово", "b-req"),
+            "c-internal": ("В работе", "b-int"),
+        }
+        self.boards = {"b-req": "p-client", "b-int": "p-internal"}
+        self.tasks: dict[str, dict] = {}
+        self.chats: dict[str, list[dict]] = {}
+        self.uploads: list[str] = []
+        self.hidden: set[str] = set()  # tasks the bot account cannot see (403)
+        self.broken: set[str] = set()  # tasks whose reading fails (400)
+        self.requests: list[str] = []
+        self.clock = 2_000_000_000_000
+
+    def message(self, chat: str, user: str, text: str) -> dict:
+        self.clock += 1
+        m = {"id": self.clock, "fromUserId": user, "text": text, "textHtml": "", "deleted": False}
+        self.chats.setdefault(chat, []).append(m)
+        return m
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        path = request.url.path.removeprefix("/api-v2")
+        self.requests.append(f"{request.method} {path}")
+        body = json.loads(request.content) if request.content and path != "/upload-file" else {}
+        if request.method == "POST" and path == "/tasks":
+            n = len(self.tasks) + 1
+            task = {"id": f"t-{n}", "idTaskCommon": f"ID-{n}", "completed": False, **body}
+            self.tasks[task["id"]] = task
+            return httpx2.Response(201, json={"id": task["id"]})
+        if m := re.fullmatch(r"/tasks/([\w-]+)", path):
+            if m[1] in self.hidden:
+                return httpx2.Response(403, json={"message": "forbidden"})
+            if m[1] in self.broken:
+                return httpx2.Response(400, json={"message": "broken"})
+            task = self.tasks.get(m[1])
+            return httpx2.Response(200, json=task) if task else httpx2.Response(404, json={})
+        if m := re.fullmatch(r"/columns/([\w-]+)", path):
+            title, board = self.columns[m[1]]
+            return httpx2.Response(200, json={"id": m[1], "title": title, "boardId": board})
+        if m := re.fullmatch(r"/boards/([\w-]+)", path):
+            return httpx2.Response(200, json={"id": m[1], "projectId": self.boards[m[1]]})
+        if m := re.fullmatch(r"/users/([\w-]+)", path):
+            return httpx2.Response(200, json={"id": m[1], "realName": "Ованес"})
+        if path == "/upload-file":
+            self.uploads.append(request.content.decode("latin-1"))
+            return httpx2.Response(201, json={"url": "/user-data/x/photo.jpg", "fullUrl": "-"})
+        if m := re.fullmatch(r"/chats/([\w-]+)/messages", path):
+            if request.method == "POST":
+                sent = self.message(m[1], "u-bot", body["text"])
+                return httpx2.Response(201, json={"id": sent["id"]})
+            since = int(request.url.params.get("since") or 0)
+            items = [x for x in self.chats.get(m[1], []) if x["id"] > since]
+            return httpx2.Response(200, json={"paging": {"next": False}, "content": items})
+        return httpx2.Response(404, json={"message": f"no route {path}"})
+
+
+@pytest.fixture
+async def store():
+    if not PG_UP:
+        pytest.skip("test Postgres is not running")
+    db = Database(DB_URL, max_size=2)
+    await db.open()
+    await db.migrate()
+    await db._exec(
+        "TRUNCATE ticket_drafts, ticket_tg_messages, tickets, ticket_senders, ticket_customers "
+        "CASCADE"
+    )
+    yield TicketStore(db)
+    await db.close()
+
+
+@pytest.fixture
+def tg() -> FakeTelegram:
+    return FakeTelegram()
+
+
+@pytest.fixture
+def yg() -> FakeYouGile:
+    return FakeYouGile()
+
+
+@pytest.fixture
+async def bot(store, tg, yg):
+    telegram = Telegram("123:abc", transport=httpx2.MockTransport(tg))
+    desks = Desks(
+        SECRETS, "https://yg.test", kv=None, rate_limit=45, transport=httpx2.MockTransport(yg)
+    )
+    yield TicketBot(telegram, store, desks, frozenset({ADMIN}))
+    await desks.close()
+    await telegram.aclose()
+
+
+async def customer(store: TicketStore):
+    return await store.add_customer(
+        name="Подружки",
+        company_id="c-1",
+        project_id="p-client",
+        column_id="c-queue",
+        bot_user_id="u-bot",
+        api_key_enc=SECRETS.encrypt("key-1"),
+    )
+
+
+_ids = iter(range(1, 10**6))
+
+
+def text(uid: int, value: str, **extra: Any) -> dict:
+    return {
+        "update_id": next(_ids),
+        "message": {
+            "message_id": next(_ids),
+            "from": {"id": uid, "first_name": "Anna", "username": "anna"},
+            "chat": {"id": uid, "type": "private"},
+            "text": value,
+            **extra,
+        },
+    }
+
+
+def photo(uid: int, caption: str | None = None) -> dict:
+    update = text(uid, "")
+    msg = update["message"]
+    del msg["text"]
+    msg["photo"] = [{"file_id": "small", "file_size": 10}, {"file_id": "big", "file_size": 999}]
+    if caption:
+        msg["caption"] = caption
+    return update
+
+
+def tap(uid: int, data: str, message: dict | None = None) -> dict:
+    return {
+        "update_id": next(_ids),
+        "callback_query": {
+            "id": str(next(_ids)),
+            "from": {"id": uid},
+            "data": data,
+            "message": message or {"message_id": 1, "chat": {"id": uid}, "text": "…"},
+        },
+    }
+
+
+def buttons(message: dict) -> list[str]:
+    rows = (message.get("reply_markup") or {}).get("inline_keyboard") or []
+    return [b["callback_data"] for row in rows for b in row]
+
+
+async def approved(bot, store, tg) -> int:  # noqa: ANN001
+    c = await customer(store)
+    await bot.handle(text(ANNA, "/start"))
+    await bot.handle(text(ANNA, "Анна, администратор, Подружки"))
+    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{c.id}"))
+    return c.id
+
+
+async def ticket(bot, tg) -> str:  # noqa: ANN001
+    await bot.handle(text(ANNA, NEW))
+    await bot.handle(text(ANNA, "Не приходят уведомления"))
+    await bot.handle(text(ANNA, "С утра <b>не</b> приходят.\n\nНомер 89001112233"))
+    await bot.handle(photo(ANNA, "скрин"))
+    await bot.handle(tap(ANNA, "send"))
+    return "t-1"
+
+
+# ---------------- access ----------------
+
+
+async def test_access_needs_an_approver(bot, store, tg):
+    c = await customer(store)
+    await bot.handle(text(ANNA, NEW))  # not approved: asked who they are
+    assert "Как вас зовут" in tg.to(ANNA)[-1]
+    await bot.handle(text(ANNA, "Анна, Подружки"))
+    assert (await store.sender(ANNA)).status == "pending"
+    request = [m for m in tg.sent if m["chat_id"] == ADMIN][-1]
+    assert "Анна, Подружки" in request["text"] and "@anna" in request["text"]
+    assert buttons(request) == [f"ok:{ANNA}:{c.id}", f"no:{ANNA}"]
+
+    await bot.handle(tap(EVE, f"ok:{ANNA}:{c.id}"))  # not an approver
+    assert (await store.sender(ANNA)).status == "pending"
+    await bot.handle(text(ANNA, NEW))
+    assert "рассматривается" in tg.to(ANNA)[-1]
+
+    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{c.id}"))
+    sender = await store.sender(ANNA)
+    assert sender.approved and sender.customer_id == c.id
+    assert "Доступ открыт" in tg.to(ANNA)[-1]
+
+
+async def test_rejected_and_blocked(bot, store, tg):
+    await customer(store)
+    await bot.handle(text(EVE, "/start"))
+    await bot.handle(text(EVE, "Ева"))
+    await bot.handle(tap(ADMIN, f"no:{EVE}"))
+    assert (await store.sender(EVE)).status == "rejected"
+    assert "отказано" in tg.to(EVE)[-1]
+    await store.decide(EVE, "blocked", None, None)
+    before = len(tg.sent)
+    await bot.handle(text(EVE, "/start"))
+    assert len(tg.sent) == before  # silence
+
+
+# ---------------- tickets ----------------
+
+
+async def test_ticket_lands_in_the_customers_column(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    task = yg.tasks["t-1"]
+    assert task["title"] == "Не приходят уведомления"
+    assert task["columnId"] == "c-queue"
+    assert "&lt;b&gt;не&lt;/b&gt;" in task["description"]  # people's text is escaped
+    assert "<p>Номер 89001112233</p>" in task["description"]
+    assert "Анна, администратор, Подружки (Подружки), Telegram @anna" in task["description"]
+    assert "скрин" in task["description"]
+    assert len(yg.uploads) == 1 and "PHOTO-BYTES" in yg.uploads[0]
+    assert yg.chats["t-1"][-1]["text"] == FILE_MARK + "/user-data/x/photo.jpg"
+    accepted = [m for m in tg.sent if m["chat_id"] == ANNA and "принята" in m["text"]][-1]
+    assert "ID-1" in accepted["text"] and buttons(accepted) == ["reply:t-1"]
+    assert await store.draft(ANNA) == {}
+
+    await bot.handle(tap(ANNA, "send"))  # a second tap creates nothing
+    assert len(yg.tasks) == 1
+    await bot.handle(text(ANNA, MINE))
+    assert "ID-1" in tg.to(ANNA)[-1]
+
+
+async def test_column_changes_and_team_messages_are_reported(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    before = len(tg.to(ANNA))
+
+    yg.tasks["t-1"]["columnId"] = "c-work"
+    assert await bot.on_event({"event": "task-moved", "payload": {"id": "t-1"}}) == 1
+    assert tg.to(ANNA)[-1] == "🔄 Заявка <b>ID-1</b> «Не приходят уведомления»: В работе."
+    await bot.on_event({"event": "task-updated", "payload": {"id": "t-1"}})
+    assert len(tg.to(ANNA)) == before + 1  # nothing new, nothing said
+
+    yg.message("t-1", "u-bot", "the bot's own message")
+    yg.message("t-1", "u-dev", "Посмотрим <сегодня>")
+    await bot.on_event({"event": "chat_message-created", "payload": {"chatId": "t-1"}})
+    assert tg.to(ANNA)[-1] == "💬 <b>ID-1</b> · <b>Ованес</b>:\nПосмотрим &lt;сегодня&gt;"
+    await bot.on_event({"event": "chat_message-created", "payload": {"chatId": "t-1"}})
+    assert len(tg.to(ANNA)) == before + 2
+
+    yg.tasks["t-1"]["columnId"] = "c-done"
+    await bot.refresh("t-1")
+    assert "✅ Заявка <b>ID-1</b>" in tg.to(ANNA)[-1]
+    assert (await store.ticket("t-1")).completed
+
+
+async def test_a_task_moved_out_of_the_clients_project_is_never_reported(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    before = len(tg.to(ANNA))
+    yg.tasks["t-1"]["columnId"] = "c-internal"
+    yg.message("t-1", "u-dev", "внутренняя кухня")
+    await bot.refresh("t-1")
+    assert len(tg.to(ANNA)) == before
+
+
+async def test_events_about_other_tasks_cost_no_requests(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    yg.requests.clear()
+    assert await bot.on_event({"event": "task-moved", "payload": {"id": "someone-else"}}) == 0
+    assert yg.requests == []
+
+
+async def test_removed_task(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    yg.tasks["t-1"]["deleted"] = True
+    await bot.refresh("t-1")
+    assert "снята" in tg.to(ANNA)[-1]
+    assert (await store.ticket("t-1")).deleted
+
+
+async def test_a_task_out_of_sight_is_not_removed(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    before = len(tg.to(ANNA))
+    yg.hidden.add("t-1")
+    await bot.refresh("t-1")
+    yg.hidden.clear()
+    task = yg.tasks.pop("t-1")  # 404
+    await bot.refresh("t-1")
+    assert len(tg.to(ANNA)) == before
+    assert not (await store.ticket("t-1")).deleted
+    yg.tasks["t-1"] = {**task, "columnId": "c-work"}  # visible again: reported as usual
+    await bot.refresh("t-1")
+    assert tg.to(ANNA)[-1].endswith("В работе.")
+
+
+async def test_one_failing_ticket_does_not_stop_the_others(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    await ticket(bot, tg)
+    yg.broken.add("t-1")
+    yg.tasks["t-2"]["columnId"] = "c-work"
+    assert await bot.refresh_open() == 1
+    assert tg.to(ANNA)[-1].startswith("🔄 Заявка <b>ID-2</b>")
+    yg.tasks["t-2"]["columnId"] = "c-done"
+    assert (
+        await bot.on_event({"event": "task-moved", "payload": {"id": "t-1", "x": {"id": "t-2"}}})
+        == 2
+    )
+    assert "✅ Заявка <b>ID-2</b>" in tg.to(ANNA)[-1]
+
+
+async def test_replies_go_to_the_tickets_chat(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    accepted = [m for m in tg.sent if m["chat_id"] == ANNA and "принята" in m["text"]][-1]
+    message_id = tg.next_id - 1  # «принята», then «Что-то ещё?»
+    assert await store.ticket_of_message(ANNA, message_id) == "t-1", accepted
+
+    await bot.handle(text(ANNA, "Уже работает", reply_to_message={"message_id": message_id}))
+    posted = yg.chats["t-1"][-1]
+    assert posted["fromUserId"] == "u-bot"
+    assert (
+        posted["text"]
+        == "Анна, администратор, Подружки (Подружки) пишет из Telegram:\nУже работает"
+    )
+
+    await bot.handle(tap(ANNA, "reply:t-1"))
+    await bot.handle(text(ANNA, "И ещё"))
+    assert yg.chats["t-1"][-1]["text"].endswith("И ещё")
+    # The bot's own messages never come back to Telegram.
+    before = len(tg.to(ANNA))
+    await bot.refresh("t-1")
+    assert len(tg.to(ANNA)) == before
+
+
+async def test_someone_elses_ticket_is_out_of_reach(bot, store, tg, yg):
+    c = await approved(bot, store, tg)
+    await ticket(bot, tg)
+    await store.request_access(EVE, "Ева", "")
+    await store.decide(EVE, "approved", c, ADMIN)
+    await bot.handle(tap(EVE, "reply:t-1"))
+    await bot.handle(text(EVE, "чужая"))
+    assert all("чужая" not in m["text"] for m in yg.chats["t-1"])
+
+
+# ---------------- webhook endpoint and helpers ----------------
+
+
+def request(secret: str, body: bytes) -> Request:
+    scope = {"type": "http", "method": "POST", "path": "/", "headers": [], "path_params": {}}
+    scope["path_params"] = {"secret": secret}
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
+
+
+async def test_hook_checks_its_secret():
+    settings = Settings(
+        public_url="https://x.test",
+        database_url=DB_URL,
+        valkey_url="valkey://127.0.0.1:1",
+        encryption_keys=[FERNET_KEY],
+        jwt_secret="t" * 48,
+    )
+    service = TicketService(settings, TicketSettings(None, frozenset()))
+    await service.start()  # no token: idle
+    assert service.bot is None
+    assert (await service.hook(request("wrong", b"{}"))).status_code == 404
+    assert (await service.hook(request(hook_secret("t" * 48), b"{}"))).status_code == 503
+    assert hook_secret("t" * 48) != hook_secret("u" * 48)
+
+
+def test_ids_in_payloads():
+    event = {"event": "chat_message-created", "payload": {"id": 17, "chatId": "t-1"}}
+    assert ids_in(event) == ["t-1"]
+    assert ids_in({"payload": {"id": "t-2", "prevData": {"columnId": "c"}}}) == ["t-2"]
+
+
+def test_attachments_and_html():
+    assert attachment({"message_id": 5, "photo": [{"file_id": "a"}, {"file_id": "b"}]}) == {
+        "file_id": "b",
+        "name": "photo_5.jpg",
+        "size": 0,
+    }
+    assert attachment({"message_id": 5, "text": "hi"}) is None
+    assert text_html("a <b>\nb\n\nc") == "<p>a &lt;b&gt;<br>b</p><p>c</p>"
+
+
+def test_settings_from_env():
+    s = TicketSettings.from_env({"TICKETS_BOT_TOKEN": " x ", "TICKETS_ADMINS": "1, 2"})
+    assert s.bot_token == "x" and s.admins == frozenset({1, 2})
+    assert TicketSettings.from_env({}).bot_token is None

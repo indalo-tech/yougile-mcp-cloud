@@ -1,0 +1,544 @@
+"""The ticket bot's conversations (Telegram side) and its reports on tickets (YouGile side)."""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+import time
+from collections import defaultdict
+from typing import Any
+
+from yougile_mcp.client import YouGileError
+
+from .desk import Desk, Desks, file_url, message_text, text_html
+from .store import Customer, Sender, Ticket, TicketStore
+from .telegram import MAX_DOWNLOAD, Telegram, TelegramError, inline
+
+log = logging.getLogger(__name__)
+
+NEW = "📝 Новая заявка"
+MINE = "📋 Мои заявки"
+MENU = {"keyboard": [[{"text": NEW}, {"text": MINE}]], "resize_keyboard": True}
+NO_MENU = {"remove_keyboard": True}
+DONE_COLUMNS = {"готово"}
+MAX_TITLE = 200
+MAX_FILES = 10
+MAX_TEXT = 3500  # Telegram allows 4096 characters per message
+
+ASK_NAME = (
+    "Здравствуйте! Это бот для заявок команде Indalo.\n\n"
+    "Как вас зовут и из какой вы компании? Ответьте одним сообщением — "
+    "после подтверждения доступа сможете отправлять заявки."
+)
+ASK_TITLE = "Коротко: что нужно сделать или что не работает? Одной строкой — это будет заголовок."
+ASK_DETAILS = (
+    "Опишите подробнее: где, что происходит, что ожидали. Можно приложить фото и файлы.\n"
+    "Когда всё готово — нажмите «Отправить»."
+)
+HELP = (
+    f"Чтобы отправить заявку — «{NEW}».\n"
+    "Чтобы написать по заявке — ответьте на сообщение бота о ней или нажмите «Ответить» под ним."
+)
+DRAFT_BUTTONS = inline([[("✅ Отправить", "send"), ("✖️ Отменить", "cancel")]])
+
+
+def esc(text: str) -> str:
+    return html.escape(text, quote=False)
+
+
+def clip(text: str, limit: int = MAX_TEXT) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def attachment(msg: dict) -> dict | None:
+    """The file in a message: {file_id, name, size}, or None."""
+    n = msg.get("message_id")
+    if doc := msg.get("document"):
+        return {
+            "file_id": doc["file_id"],
+            "name": doc.get("file_name") or f"file_{n}",
+            **_size(doc),
+        }
+    if photos := msg.get("photo"):
+        return {"file_id": photos[-1]["file_id"], "name": f"photo_{n}.jpg", **_size(photos[-1])}
+    for kind, name in (
+        ("video", f"video_{n}.mp4"),
+        ("voice", f"voice_{n}.ogg"),
+        ("audio", f"audio_{n}.mp3"),
+        ("video_note", f"video_{n}.mp4"),
+    ):
+        if item := msg.get(kind):
+            return {
+                "file_id": item["file_id"],
+                "name": item.get("file_name") or name,
+                **_size(item),
+            }
+    return None
+
+
+def _size(item: dict) -> dict:
+    return {"size": int(item.get("file_size") or 0)}
+
+
+def is_done(task: dict, column_title: str) -> bool:
+    return bool(task.get("completed")) or column_title.strip().lower() in DONE_COLUMNS
+
+
+def shape(value: Any, depth: int = 0) -> Any:
+    """The structure of a payload without its values: {key: shape} and type names."""
+    if isinstance(value, dict) and depth < 3:
+        return {k: shape(v, depth + 1) for k, v in list(value.items())[:30]}
+    if isinstance(value, list):
+        return [shape(value[0], depth + 1)] if value else []
+    return type(value).__name__
+
+
+def ids_in(payload: Any, depth: int = 0) -> list[str]:
+    """Object ids anywhere near the top of a webhook payload (its format is not documented)."""
+    found: list[str] = []
+    if depth > 3:
+        return found
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in ("id", "taskId", "chatId", "objectId", "parentId") and isinstance(value, str):
+                found.append(value)
+            elif isinstance(value, dict | list):
+                found += ids_in(value, depth + 1)
+    elif isinstance(payload, list):
+        for item in payload[:20]:
+            found += ids_in(item, depth + 1)
+    return list(dict.fromkeys(found))
+
+
+class TicketBot:
+    def __init__(
+        self, tg: Telegram, store: TicketStore, desks: Desks, admins: frozenset[int]
+    ) -> None:
+        self.tg = tg
+        self.store = store
+        self.desks = desks
+        self.admins = admins
+        self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+    # ================= Telegram side =================
+
+    async def handle(self, update: dict) -> None:
+        if msg := update.get("message"):
+            if (msg.get("chat") or {}).get("type") == "private" and msg.get("from"):
+                await self.on_message(msg)
+        elif cq := update.get("callback_query"):
+            await self.on_callback(cq)
+
+    async def on_message(self, msg: dict) -> None:
+        uid = msg["from"]["id"]
+        chat = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip()
+        if text == "/id":
+            await self.tg.send(chat, f"Ваш Telegram id: <code>{uid}</code>")
+            return
+        sender = await self.store.sender(uid)
+        if sender is None or not sender.approved:
+            await self.stranger(msg, sender, text)
+            return
+        draft = await self.store.draft(uid)
+
+        if text in ("/start", "/menu", "/help"):
+            await self.store.save_draft(uid, {})
+            await self.tg.send(chat, HELP, markup=MENU)
+            return
+        if text in ("/cancel", "Отмена", "Отменить"):
+            await self.store.save_draft(uid, {})
+            await self.tg.send(chat, "Отменено.", markup=MENU)
+            return
+        if text in (NEW, "/new"):
+            await self.store.save_draft(uid, {"step": "title"})
+            await self.tg.send(chat, ASK_TITLE)
+            return
+        if text in (MINE, "/my"):
+            await self.list_tickets(chat, uid)
+            return
+
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        if reply_to and (task_id := await self.store.ticket_of_message(chat, reply_to)):
+            await self.relay(sender, msg, task_id)
+            return
+
+        step = draft.get("step")
+        if step == "title":
+            await self.take_title(chat, uid, draft, msg, text)
+        elif step == "details":
+            await self.take_details(chat, uid, draft, msg, text)
+        elif step == "reply":
+            await self.store.save_draft(uid, {})
+            await self.relay(sender, msg, draft["task_id"])
+        else:
+            await self.tg.send(chat, HELP, markup=MENU)
+
+    async def stranger(self, msg: dict, sender: Sender | None, text: str) -> None:
+        """Someone without access: ask who they are, pass the request to the approvers."""
+        uid, chat = msg["from"]["id"], msg["chat"]["id"]
+        if sender and sender.status == "blocked":
+            return
+        if sender and sender.status == "pending":
+            await self.tg.send(
+                chat, "Запрос на доступ ещё рассматривается. Напишу, как только решат."
+            )
+            return
+        draft = await self.store.draft(uid)
+        if draft.get("step") != "intro" or not text or text.startswith("/"):
+            await self.store.save_draft(uid, {"step": "intro"})
+            await self.tg.send(chat, ASK_NAME, markup=NO_MENU)
+            return
+        user = msg["from"]
+        sender = await self.store.request_access(uid, clip(text, 200), user.get("username") or "")
+        await self.store.save_draft(uid, {})
+        await self.tg.send(chat, "Спасибо! Запрос на доступ отправлен. Напишу, когда его одобрят.")
+        await self.ask_approvers(sender, user)
+
+    async def ask_approvers(self, sender: Sender, user: dict) -> None:
+        customers = await self.store.customers()
+        who = esc(sender.name)
+        tg_name = esc(" ".join(filter(None, [user.get("first_name"), user.get("last_name")])))
+        handle = f" @{esc(sender.username)}" if sender.username else ""
+        text = (
+            f"Запрос доступа к заявкам:\n<b>{who}</b>\n"
+            f"Telegram: {tg_name}{handle} (id <code>{sender.tg_user_id}</code>)\n\n"
+            "От какой компании он(а)?"
+        )
+        rows = [[(f"✅ {c.name}", f"ok:{sender.tg_user_id}:{c.id}")] for c in customers]
+        rows.append([("❌ Отклонить", f"no:{sender.tg_user_id}")])
+        for admin in self.admins:
+            try:
+                await self.tg.send(admin, text, markup=inline(rows))
+            except TelegramError as exc:  # an approver who never started the bot
+                log.warning("cannot notify approver %s: %s", admin, exc)
+
+    async def on_callback(self, cq: dict) -> None:
+        uid = cq["from"]["id"]
+        data = cq.get("data") or ""
+        msg = cq.get("message") or {}
+        chat = (msg.get("chat") or {}).get("id", uid)
+        answer: str | None = None
+        try:
+            if data.startswith(("ok:", "no:")):
+                answer = await self.decide(uid, data, msg)
+            else:
+                sender = await self.store.sender(uid)
+                if sender is None or not sender.approved:
+                    answer = "Нет доступа"
+                elif data == "send":
+                    await self.submit(chat, sender)
+                elif data == "cancel":
+                    await self.store.save_draft(uid, {})
+                    await self.tg.send(chat, "Отменено.", markup=MENU)
+                elif data.startswith("reply:"):
+                    answer = await self.start_reply(chat, sender, data.removeprefix("reply:"))
+        finally:
+            try:
+                await self.tg.call("answerCallbackQuery", callback_query_id=cq["id"], text=answer)
+            except TelegramError as exc:
+                log.info("answerCallbackQuery: %s", exc)
+
+    async def decide(self, uid: int, data: str, msg: dict) -> str:
+        if uid not in self.admins:
+            return "Только для администраторов"
+        parts = data.split(":")
+        target = int(parts[1])
+        customer = None
+        if parts[0] == "ok":
+            customer = await self.store.customer(int(parts[2]))
+            if customer is None:
+                return "Компания не найдена"
+        sender = await self.store.decide(
+            target, "approved" if customer else "rejected", customer.id if customer else None, uid
+        )
+        if sender is None:
+            return "Запрос не найден"
+        verdict = f"✅ Одобрено: {customer.name}" if customer else "❌ Отклонено"  # plain text
+        if msg.get("message_id"):
+            try:
+                await self.tg.call(
+                    "editMessageText",
+                    chat_id=msg["chat"]["id"],
+                    message_id=msg["message_id"],
+                    text=f"{msg.get('text') or ''}\n\n{verdict}",
+                )
+            except TelegramError as exc:
+                log.info("editMessageText: %s", exc)
+        try:
+            if customer:
+                await self.tg.send(
+                    target, f"Доступ открыт. Теперь можно отправлять заявки.\n\n{HELP}", markup=MENU
+                )
+            else:
+                await self.tg.send(target, "К сожалению, в доступе отказано.")
+        except TelegramError as exc:
+            log.info("cannot tell sender %s: %s", target, exc)
+        return "Готово"
+
+    async def take_title(self, chat: int, uid: int, draft: dict, msg: dict, text: str) -> None:
+        if not text or text.startswith("/"):
+            await self.tg.send(chat, "Сначала напишите заголовок текстом — одной строкой.")
+            return
+        title = clip(" ".join(text.split()), MAX_TITLE)
+        await self.store.save_draft(
+            uid, {"step": "details", "title": title, "parts": [], "files": []}
+        )
+        await self.tg.send(chat, ASK_DETAILS, markup=DRAFT_BUTTONS)
+
+    async def take_details(self, chat: int, uid: int, draft: dict, msg: dict, text: str) -> None:
+        caption = (msg.get("caption") or "").strip()
+        file = attachment(msg)
+        notes: list[str] = []
+        if text or caption:
+            draft["parts"].append(text or caption)
+            notes.append("текст")
+        if file:
+            if file["size"] > MAX_DOWNLOAD:
+                await self.tg.send(
+                    chat, "Файл больше 20 МБ: бот такие не принимает. Пришлите ссылку."
+                )
+                return
+            if len(draft["files"]) >= MAX_FILES:
+                await self.tg.send(chat, f"Не больше {MAX_FILES} файлов на заявку.")
+                return
+            draft["files"].append(file)
+            notes.append(f"файл {esc(file['name'])}")
+        if not notes:
+            await self.tg.send(
+                chat, "Такое сообщение бот не понимает: пришлите текст, фото или файл."
+            )
+            return
+        await self.store.save_draft(uid, draft)
+        await self.tg.send(
+            chat,
+            f"Добавлено: {', '.join(notes)}. Ещё что-то — или «Отправить».",
+            markup=DRAFT_BUTTONS,
+        )
+
+    async def submit(self, chat: int, sender: Sender) -> None:
+        uid = sender.tg_user_id
+        async with self._locks[f"user:{uid}"]:
+            draft = await self.store.draft(uid)
+            if draft.get("step") != "details":
+                return  # sent already (a second tap) or cancelled
+            customer = await self.store.customer(sender.customer_id or 0)
+            if customer is None:
+                await self.tg.send(chat, "Компания не настроена: напишите администратору.")
+                return
+            await self.store.save_draft(uid, {})
+            desk = self.desks.get(customer)
+            title = draft["title"]
+            body = "\n\n".join(draft.get("parts") or []) or title
+            signature = f"{sender.name} ({customer.name})" + (
+                f", Telegram @{sender.username}" if sender.username else ", Telegram"
+            )
+            description = text_html(body) + f"<p><i>Заявка из Telegram: {esc(signature)}</i></p>"
+            try:
+                task = await desk.create_task(title, description)
+            except YouGileError as exc:
+                log.warning("cannot create a ticket for %s: %s", customer.name, exc)
+                await self.store.save_draft(uid, draft)
+                await self.tg.send(
+                    chat,
+                    "Не получилось создать заявку. Попробуйте «Отправить» ещё раз чуть позже.",
+                    markup=DRAFT_BUTTONS,
+                )
+                return
+            failed = await self.upload(desk, task["id"], draft.get("files") or [])
+            number = task.get("idTaskCommon") or task["id"]
+            await self.store.add_ticket(
+                task_id=task["id"],
+                customer_id=customer.id,
+                tg_user_id=uid,
+                number=number,
+                title=title,
+                column_id=task.get("columnId") or customer.column_id,
+                last_message_id=now_ms(),
+            )
+            note = f"\n\nНе удалось приложить: {esc(', '.join(failed))}." if failed else ""
+            await self.say(
+                chat,
+                task["id"],
+                f"✅ Заявка <b>{esc(number)}</b> принята: «{esc(title)}».\n"
+                f"Напишу, когда она сдвинется. Ответить по ней — кнопкой ниже "
+                f"или ответом на это сообщение.{note}",
+            )
+            await self.tg.send(chat, "Что-то ещё?", markup=MENU)
+
+    async def upload(self, desk: Desk, task_id: str, files: list[dict]) -> list[str]:
+        """Attach Telegram files to the ticket's chat; returns the names that failed."""
+        failed: list[str] = []
+        for file in files:
+            try:
+                data = await self.tg.download(file["file_id"])
+                await desk.attach(task_id, file["name"], data)
+            except (TelegramError, YouGileError) as exc:
+                log.warning("attaching a file failed: %s", exc)
+                failed.append(file["name"])
+        return failed
+
+    async def start_reply(self, chat: int, sender: Sender, task_id: str) -> str | None:
+        ticket = await self.store.ticket(task_id)
+        if ticket is None or ticket.tg_user_id != sender.tg_user_id:
+            return "Заявка не найдена"
+        await self.store.save_draft(sender.tg_user_id, {"step": "reply", "task_id": task_id})
+        await self.tg.send(chat, f"Напишите сообщение по заявке <b>{esc(ticket.number)}</b>:")
+        return None
+
+    async def relay(self, sender: Sender, msg: dict, task_id: str) -> None:
+        """A sender's message about their ticket goes to the ticket's chat in YouGile."""
+        chat = msg["chat"]["id"]
+        ticket = await self.store.ticket(task_id)
+        if ticket is None or ticket.tg_user_id != sender.tg_user_id or ticket.deleted:
+            await self.tg.send(chat, "Эта заявка недоступна.", markup=MENU)
+            return
+        customer = await self.store.customer(ticket.customer_id)
+        assert customer is not None
+        desk = self.desks.get(customer)
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        file = attachment(msg)
+        if not text and not file:
+            await self.tg.send(chat, "Пришлите текст, фото или файл.")
+            return
+        header = f"{sender.name} ({customer.name}) пишет из Telegram:"
+        try:
+            await desk.post(task_id, f"{header}\n{text}" if text else f"{header} файл")
+            failed = await self.upload(desk, task_id, [file]) if file else []
+        except YouGileError as exc:
+            log.warning("relaying to %s failed: %s", ticket.number, exc)
+            await self.tg.send(chat, "Не получилось передать сообщение. Попробуйте позже.")
+            return
+        note = " Файл приложить не удалось." if failed else ""
+        await self.say(chat, task_id, f"Передал в заявку <b>{esc(ticket.number)}</b>.{note}")
+
+    async def list_tickets(self, chat: int, uid: int) -> None:
+        tickets = await self.store.tickets_of(uid)
+        if not tickets:
+            await self.tg.send(chat, "Заявок пока нет.", markup=MENU)
+            return
+        lines = []
+        for t in tickets:
+            mark = "✅" if t.completed else "•"
+            lines.append(f"{mark} <b>{esc(t.number)}</b> {esc(clip(t.title, 80))}")
+        rows = [
+            [(f"Ответить {t.number}", f"reply:{t.task_id}")] for t in tickets if not t.completed
+        ]
+        await self.tg.send(
+            chat, "Ваши заявки:\n" + "\n".join(lines), markup=inline(rows[:8]) if rows else MENU
+        )
+
+    async def say(self, chat: int, task_id: str, text: str) -> None:
+        """A message about a ticket, with a reply button; replies to it reach the ticket."""
+        sent = await self.tg.send(
+            chat, text, markup=inline([[("💬 Ответить", f"reply:{task_id}")]])
+        )
+        await self.store.link_message(chat, sent["message_id"], task_id)
+
+    # ================= YouGile side =================
+
+    async def on_event(self, event: dict) -> int:
+        """A YouGile webhook: refresh the tickets it may concern. Returns how many."""
+        name = str(event.get("event") or "")
+        known = await self.store.known(ids_in(event))
+        # The payload format is not documented: its shape (never its values) helps to see why.
+        log.info("YouGile event %s %s: %d ticket(s)", name, shape(event), len(known))
+        for task_id in known:
+            try:
+                await self.refresh(task_id, chat=not name.startswith("task-"))
+            except Exception:
+                log.exception("refreshing ticket %s failed", task_id)
+        return len(known)
+
+    async def refresh_open(self) -> int:
+        """Check every open ticket (webhooks can be lost); returns how many failed."""
+        failed = 0
+        for ticket in await self.store.open_tickets():
+            try:
+                await self.refresh(ticket.task_id)
+            except Exception:
+                log.exception("refreshing ticket %s failed", ticket.number)
+                failed += 1
+        return failed
+
+    async def refresh(self, task_id: str, *, chat: bool = True) -> None:
+        """Compare a ticket with its task and tell the sender what changed: the column (or
+        completion, or removal) and new messages in the task's chat. A task that has left
+        the customer's project is not reported at all."""
+        async with self._locks[f"task:{task_id}"]:
+            ticket = await self.store.ticket(task_id)
+            if ticket is None or ticket.deleted:
+                return
+            customer = await self.store.customer(ticket.customer_id)
+            assert customer is not None
+            desk = self.desks.get(customer)
+            try:
+                task = await desk.task(task_id)
+                column_id = task.get("columnId")
+                column = await desk.column(column_id) if column_id else None
+            except YouGileError as exc:
+                if exc.status not in (403, 404):
+                    raise
+                # Out of the bot account's sight (moved to a board it cannot read): that is
+                # not removal, YouGile deletes softly. Say nothing, change nothing.
+                log.info("ticket %s is not visible to the bot (%s)", ticket.number, exc.status)
+                return
+            if task.get("deleted"):
+                await self.store.update_ticket(task_id, deleted=True)
+                await self.notify(
+                    ticket, f"Заявка <b>{esc(ticket.number)}</b> «{esc(ticket.title)}» снята."
+                )
+                return
+            if column is None or column.project_id != customer.project_id:
+                log.info("ticket %s is outside the customer's project: not reported", ticket.number)
+                return
+            await self.report_status(ticket, task, column.id, column.title)
+            if chat:
+                await self.report_messages(ticket, customer, desk)
+
+    async def report_status(self, ticket: Ticket, task: dict, column_id: str, title: str) -> None:
+        done = is_done(task, title)
+        name = task.get("title") or ticket.title
+        if column_id == ticket.column_id and done == ticket.completed and name == ticket.title:
+            return
+        await self.store.update_ticket(
+            ticket.task_id, column_id=column_id, completed=done, title=name
+        )
+        if column_id == ticket.column_id and done == ticket.completed:
+            return  # only the title changed
+        head = f"<b>{esc(ticket.number)}</b> «{esc(name)}»"
+        text = f"✅ Заявка {head} выполнена." if done else f"🔄 Заявка {head}: {esc(title)}."
+        await self.notify(ticket, text)
+
+    async def report_messages(self, ticket: Ticket, customer: Customer, desk: Desk) -> None:
+        messages = await desk.messages_since(ticket.task_id, ticket.last_message_id)
+        if not messages:
+            return
+        newest = ticket.last_message_id
+        for m in messages:
+            newest = max(newest, int(m["id"]))
+            if m.get("deleted") or m.get("fromUserId") == customer.bot_user_id:
+                continue
+            author = esc(await desk.user_name(m.get("fromUserId") or ""))
+            url = file_url(m)
+            if url:
+                body = f'📎 <a href="{esc(desk.link(url))}">файл</a>'
+            else:
+                body = esc(clip(message_text(m)))
+            if not body:
+                continue
+            await self.notify(ticket, f"💬 <b>{esc(ticket.number)}</b> · <b>{author}</b>:\n{body}")
+            # Saved per message: a failure further on must not repeat what was sent.
+            await self.store.update_ticket(ticket.task_id, last_message_id=newest)
+        await self.store.update_ticket(ticket.task_id, last_message_id=newest)
+
+    async def notify(self, ticket: Ticket, text: str) -> None:
+        try:
+            await self.say(ticket.tg_user_id, ticket.task_id, text)
+        except TelegramError as exc:  # the sender blocked the bot, say
+            log.info("cannot notify about %s: %s", ticket.number, exc)

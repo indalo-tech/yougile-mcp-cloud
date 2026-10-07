@@ -5,7 +5,7 @@
 
 | файл | откуда | что это |
 |---|---|---|
-| `compose.yaml` | копия [`compose.yaml`](compose.yaml) | приложение, PostgreSQL, Valkey |
+| `compose.yaml` | копия [`compose.yaml`](compose.yaml) | приложение, бот заявок, PostgreSQL, Valkey |
 | `deploy.sh` | копия [`deploy.sh`](deploy.sh) | единственное, что может ключ CI |
 | `.env` | создаётся на сервере по [`env.example`](env.example), `chmod 600` | настройки и секреты |
 | `/etc/caddy/sites/yougile.caddy` | копия [`yougile.caddy`](yougile.caddy) | сайт в Caddy хоста |
@@ -66,6 +66,19 @@ docker compose logs --tail 100 app
 docker compose exec app yougile-cloud companies
 docker compose exec app yougile-cloud company <id> --exempt
 docker compose exec postgres psql -U yougile yougile
+```
+
+### Бот заявок
+
+Процесс `tickets` (порт `127.0.0.1:8101`, Caddy отдаёт ему `/tickets/hook/*`). Включение:
+
+```bash
+cd /home/deploy/yougile-mcp-cloud
+# в .env: TICKETS_BOT_TOKEN=<токен от @BotFather>, TICKETS_ADMINS=<telegram id через запятую>
+docker compose up -d tickets
+docker compose exec -it tickets yougile-cloud tickets customer-add "Подружки" --column <id>
+docker compose exec -it tickets yougile-cloud tickets webhooks      # или с --admin
+docker compose logs --tail 100 tickets
 ```
 
 Резервные копии пока не настроены: потеря базы — это переподключение всех людей и потеря
