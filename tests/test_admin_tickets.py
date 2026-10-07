@@ -77,8 +77,10 @@ async def test_token_and_approvers(server, settings, http, telegram, store):
 
     bad = await post(http, settings, "/admin/tickets/telegram", {"token": "", "admins": "12 x"})
     assert bad.status_code == 200 and "только цифры" in bad.text
+    junk = await post(http, settings, "/admin/tickets/telegram", {"token": "abc", "admins": ""})
+    assert "не похоже на токен" in junk.text
     wrong = await post(
-        http, settings, "/admin/tickets/telegram", {"token": "1:" + "B" * 35, "admins": ""}
+        http, settings, "/admin/tickets/telegram", {"token": "654321:" + "B" * 35, "admins": ""}
     )
     assert "Telegram не принял токен" in wrong.text
     assert await store.bot_config() is None
@@ -158,5 +160,6 @@ async def test_webhooks_are_made_with_the_admins_key(server, settings, http, fak
     await post(http, settings, "/admin/tickets/webhooks", {})
     assert len(fake.webhooks) == 2, "subscribing again changes nothing"
     page = await http.get("/admin/tickets")
-    assert page.text.count("работает") == 2 and "Проверить подписки" in page.text
+    assert page.text.count('<td data-label="Состояние">работает</td>') == 2
+    assert "Проверить подписки" in page.text
     assert json.dumps(hook_url(settings))[1:-1] not in page.text, "the hook secret is not shown"
