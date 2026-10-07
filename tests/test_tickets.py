@@ -343,6 +343,40 @@ async def test_each_sender_writes_to_their_own_project(bot, store, tg, yg):
     assert "Очередь" not in tg.to(ANNA)[-1]
 
 
+async def test_an_approver_moves_a_sender_to_another_project(bot, store, tg, yg):
+    a = await approved(bot, store, tg)
+    await ticket(bot, tg)
+    await bot.handle(text(EVE, "/senders"))  # not an approver: just a stranger
+    assert "Сотрудники" not in tg.to(EVE)[-1]
+
+    await bot.handle(text(ADMIN, "/senders"))
+    listing = [m for m in tg.sent if m["chat_id"] == ADMIN][-1]
+    assert buttons(listing) == [f"mvl:{ANNA}"]
+    assert "Работы" in listing["reply_markup"]["inline_keyboard"][0][0]["text"]
+    await bot.handle(tap(ADMIN, f"mvl:{ANNA}"))
+    offer = [m for m in tg.sent if m["chat_id"] == ADMIN][-1]
+    assert buttons(offer) == [f"mv:{ANNA}:{a}:p-other"]  # the current project is not offered
+
+    await bot.handle(tap(EVE, f"mv:{ANNA}:{a}:p-other"))
+    assert (await store.sender(ANNA)).project_id == "p-client"
+    await bot.handle(tap(ADMIN, f"mv:{ANNA}:{a}:p-internal"))  # no «Заявки» there
+    assert (await store.sender(ANNA)).project_id == "p-client"
+
+    await bot.handle(text(ANNA, NEW))  # a draft in progress is dropped by the move
+    await bot.handle(tap(ADMIN, f"mv:{ANNA}:{a}:p-other"))
+    sender = await store.sender(ANNA)
+    assert sender.approved and sender.project_id == "p-other"
+    assert sender.project_name == "Клиент Б"
+    assert "«Клиент Б»" in tg.to(ANNA)[-1]
+    assert await store.draft(ANNA) == {}
+
+    await ticket(bot, tg)
+    assert yg.tasks["t-2"]["columnId"] == "c-new"
+    yg.tasks["t-1"]["columnId"] = "c-work"  # the old ticket stays in its project, still reported
+    await bot.refresh("t-1")
+    assert tg.to(ANNA)[-1].startswith("🔄 Заявка <b>ID-1</b>")
+
+
 async def test_a_ticket_moved_to_another_board_of_its_project_is_still_reported(bot, store, tg, yg):
     await approved(bot, store, tg)
     await ticket(bot, tg)

@@ -40,6 +40,7 @@ HELP = (
     f"Чтобы отправить заявку — «{NEW}».\n"
     "Чтобы написать по заявке — ответьте на сообщение бота о ней или нажмите «Ответить» под ним."
 )
+NO_PROJECT = "Проект не найден или в нём больше нет доски «Заявки»"
 DRAFT_BUTTONS = inline([[("✅ Отправить", "send"), ("✖️ Отменить", "cancel")]])
 
 
@@ -141,6 +142,9 @@ class TicketBot:
         if text == "/id":
             await self.tg.send(chat, f"Ваш Telegram id: <code>{uid}</code>")
             return
+        if text == "/senders" and uid in self.admins:
+            await self.list_senders(chat)
+            return
         sender = await self.store.sender(uid)
         if sender is None or not sender.approved:
             await self.stranger(msg, sender, text)
@@ -222,7 +226,8 @@ class TicketBot:
         text = (
             f"Запрос доступа к заявкам:\n<b>{who}</b>\n"
             f"Telegram: {tg_name}{handle} (id <code>{sender.tg_user_id}</code>)\n\n"
-            "В какой проект пойдут его (её) заявки? Они попадут на доску «Заявки» проекта."
+            "В какой проект пойдут его (её) заявки? Они попадут на доску «Заявки» проекта.\n"
+            "Перевести потом в другой проект — /senders."
         )
         choices = await self.choices()
         if not choices:
@@ -244,6 +249,10 @@ class TicketBot:
         try:
             if data.startswith(("ok:", "no:")):
                 answer = await self.decide(uid, data, msg)
+            elif data.startswith("mvl:"):
+                answer = await self.offer_move(uid, chat, int(data.removeprefix("mvl:")))
+            elif data.startswith("mv:"):
+                answer = await self.move(uid, data, msg)
             else:
                 sender = await self.store.sender(uid)
                 if sender is None or not sender.approved:
@@ -267,11 +276,9 @@ class TicketBot:
         parts = data.split(":")
         target = int(parts[1])
         if parts[0] == "ok":
-            account = await self.store.account(int(parts[2]))
-            projects = await self.desks.get(account).projects(fresh=True) if account else {}
-            project = projects.get(parts[3]) if len(parts) > 3 else None
+            account, project = await self.chosen(parts[2:])
             if account is None or project is None:
-                return "Проект не найден или в нём больше нет доски «Заявки»"
+                return NO_PROJECT
             sender = await self.store.decide(
                 target,
                 "approved",
@@ -280,23 +287,14 @@ class TicketBot:
                 project_id=project.id,
                 project_name=project.title,
             )
-            verdict = f"✅ Одобрено, проект: {project.title}"  # plain text
+            verdict = f"✅ Одобрено, проект: {project.title}"
         else:
             project = None
             sender = await self.store.decide(target, "rejected", by=uid)
             verdict = "❌ Отклонено"
         if sender is None:
             return "Запрос не найден"
-        if msg.get("message_id"):
-            try:
-                await self.tg.call(
-                    "editMessageText",
-                    chat_id=msg["chat"]["id"],
-                    message_id=msg["message_id"],
-                    text=f"{msg.get('text') or ''}\n\n{verdict}",
-                )
-            except TelegramError as exc:
-                log.info("editMessageText: %s", exc)
+        await self.mark(msg, verdict)
         try:
             if project:
                 await self.tg.send(
@@ -307,6 +305,97 @@ class TicketBot:
         except TelegramError as exc:
             log.info("cannot tell sender %s: %s", target, exc)
         return "Готово"
+
+    async def chosen(self, ref: list[str]) -> tuple[Account | None, Project | None]:
+        """The account and project of a button's ``<account id>:<project id>``."""
+        if len(ref) != 2 or not ref[0].isdigit():
+            return None, None
+        account = await self.store.account(int(ref[0]))
+        if account is None:
+            return None, None
+        projects = await self.desks.get(account).projects(fresh=True)
+        return account, projects.get(ref[1])
+
+    async def mark(self, msg: dict, verdict: str) -> None:
+        """Append the decision to an approver's message (plain text: no markup to escape)."""
+        if not msg.get("message_id"):
+            return
+        try:
+            await self.tg.call(
+                "editMessageText",
+                chat_id=msg["chat"]["id"],
+                message_id=msg["message_id"],
+                text=f"{msg.get('text') or ''}\n\n{verdict}",
+            )
+        except TelegramError as exc:
+            log.info("editMessageText: %s", exc)
+
+    async def list_senders(self, chat: int) -> None:
+        senders = [s for s in await self.store.senders() if s.approved]
+        if not senders:
+            await self.tg.send(chat, "Одобренных сотрудников пока нет.")
+            return
+        rows = [
+            [(f"🔀 {clip(s.name, 40)} — {s.project_name}", f"mvl:{s.tg_user_id}")]
+            for s in senders[:90]  # Telegram allows 100 buttons per message
+        ]
+        await self.tg.send(
+            chat, "Сотрудники и их проекты. Нажмите, чтобы перевести в другой:", markup=inline(rows)
+        )
+
+    async def offer_move(self, uid: int, chat: int, target: int) -> str | None:
+        if uid not in self.admins:
+            return "Только для администраторов"
+        sender = await self.store.sender(target)
+        if sender is None or not sender.approved:
+            return "Сотрудник не найден"
+        choices = [
+            (label, ref)
+            for label, ref in await self.choices()
+            if ref != f"{sender.account_id}:{sender.project_id}"
+        ]
+        if not choices:
+            return "Других проектов с доской «Заявки» нет"
+        rows = [[(f"➡️ {label}", f"mv:{target}:{ref}")] for label, ref in choices]
+        await self.tg.send(
+            chat,
+            f"Куда перевести <b>{esc(sender.name)}</b>? Сейчас: {esc(sender.project_name)}.\n"
+            "Новые заявки пойдут в выбранный проект, отправленные останутся где были.",
+            markup=inline(rows),
+        )
+        return None
+
+    async def move(self, uid: int, data: str, msg: dict) -> str:
+        if uid not in self.admins:
+            return "Только для администраторов"
+        parts = data.split(":")
+        target = int(parts[1])
+        current = await self.store.sender(target)
+        if current is None or not current.approved:
+            return "Сотрудник не найден"
+        account, project = await self.chosen(parts[2:])
+        if account is None or project is None:
+            return NO_PROJECT
+        await self.store.decide(
+            target,
+            "approved",
+            by=uid,
+            account_id=account.id,
+            project_id=project.id,
+            project_name=project.title,
+        )
+        await self.store.save_draft(target, {})  # a half-written ticket was for the old project
+        await self.mark(msg, f"✅ {current.name}: {current.project_name} → {project.title}")
+        try:
+            await self.tg.send(
+                target,
+                f"Теперь ваши заявки идут в проект «{esc(project.title)}». "
+                "Уже отправленные остаются там, где были.",
+                markup=MENU,
+            )
+        except TelegramError as exc:
+            log.info("cannot tell sender %s: %s", target, exc)
+        return "Переведён"
 
     async def take_title(self, chat: int, uid: int, draft: dict, msg: dict, text: str) -> None:
         if not text or text.startswith("/"):
