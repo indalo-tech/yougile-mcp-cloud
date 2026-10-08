@@ -36,6 +36,10 @@ class FakeTelegram:
         self.refuse_topics = False  # createForumTopic fails
         self.dead_threads: set[int] = set()  # topics Telegram no longer knows
         self.topics: dict[int, str] = {}  # thread id: name
+        self.deleted: list[int] = []  # deleteMessage
+        self.deleted_topics: list[int] = []
+        self.edits: list[dict] = []  # editMessageText
+        self.reactions: list[dict] = []
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
@@ -71,6 +75,15 @@ class FakeTelegram:
             result = {"message_thread_id": thread, "name": body["name"], "icon_color": 0}
         elif method == "editForumTopic":
             self.topics[body["message_thread_id"]] = body["name"]
+        elif method == "deleteForumTopic":
+            self.deleted_topics.append(body["message_thread_id"])
+            self.topics.pop(body["message_thread_id"], None)
+        elif method == "deleteMessage":
+            self.deleted.append(body["message_id"])
+        elif method == "editMessageText":
+            self.edits.append(body)
+        elif method == "setMessageReaction":
+            self.reactions.append(body)
         elif method == "getFile":
             result = {"file_id": body["file_id"], "file_path": f"photos/{body['file_id']}.jpg"}
         return httpx2.Response(200, json={"ok": True, "result": result})
@@ -172,8 +185,8 @@ async def store():
     await db.open()
     await db.migrate()
     await db._exec(
-        "TRUNCATE ticket_bot, ticket_drafts, ticket_tg_messages, tickets, ticket_senders, "
-        "ticket_accounts CASCADE"
+        "TRUNCATE ticket_bot, ticket_admin_topics, ticket_drafts, ticket_tg_messages, tickets, "
+        "ticket_senders, ticket_accounts CASCADE"
     )
     yield TicketStore(db)
     await db.close()
@@ -517,58 +530,119 @@ def in_topic(uid: int, thread: int, value: str) -> dict:
     return update
 
 
-async def test_each_ticket_gets_its_own_topic(bot, store, tg, yg):
+def photo_in_topic(uid: int, thread: int) -> dict:
+    update = photo(uid)
+    update["message"] |= {"message_thread_id": thread, "is_topic_message": True}
+    return update
+
+
+def tap_in(uid: int, data: str, thread: int) -> dict:
+    message = {
+        "message_id": 1,
+        "chat": {"id": uid},
+        "text": "…",
+        "message_thread_id": thread,
+        "is_topic_message": True,
+    }
+    return tap(uid, data, message)
+
+
+async def test_in_topic_mode_a_new_topic_is_a_new_ticket(bot, store, tg, yg):
     tg.topics_on = True
     await approved(bot, store, tg)
-    await ticket(bot, tg)
-    assert tg.topics == {500: "ID-1 · Не приходят уведомления"}
-    assert (await store.ticket("t-1")).tg_thread_id == 500
-    accepted = [m for m in tg.sent if "принята" in m["text"]]
-    assert accepted[0]["message_thread_id"] == 500 and "reply_markup" not in accepted[0]
-    assert "в отдельной теме" in accepted[1]["text"] and "message_thread_id" not in accepted[1]
+    start = len(tg.sent)
 
+    await bot.handle(in_topic(ANNA, 700, "Не приходят уведомления\nС утра, на Невском"))
+    card = tg.last(ANNA)
+    assert card["message_thread_id"] == 700 and "«Не приходят уведомления»" in card["text"]
+    assert buttons(card) == ["send:700", "cancel:700"]
+    first_card = tg.next_id
+    await bot.handle(photo_in_topic(ANNA, 700))
+    assert first_card in tg.deleted, "the card follows the latest message"
+    assert "файлов: 1" in tg.last(ANNA)["text"] and yg.tasks == {}
+
+    card = tg.next_id
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    task = yg.tasks["t-1"]
+    assert task["title"] == "Не приходят уведомления" and "на Невском" in task["description"]
+    assert len(yg.uploads) == 1
+    assert (await store.ticket("t-1")).tg_thread_id == 700
+    assert tg.topics[700] == "ID-1 · Не приходят уведомления"  # the topic takes the ticket's name
+    assert tg.edits[-1]["message_id"] == card and "принята" in tg.edits[-1]["text"]
+    assert await store.draft(ANNA, 700) == {}
+    await bot.handle(tap_in(ANNA, "send:700", 700))  # a second tap creates nothing
+    assert len(yg.tasks) == 1
+
+    # The topic now talks to the ticket: a 👍 says the message got there.
+    await bot.handle(in_topic(ANNA, 700, "Ещё деталь"))
+    assert yg.chats["t-1"][-1]["text"].endswith("Ещё деталь")
+    assert tg.reactions[-1]["reaction"] == [{"type": "emoji", "emoji": "👍"}]
     yg.tasks["t-1"]["columnId"] = "c-work"
-    yg.message("t-1", "u-dev", "На каком филиале?")
+    yg.message("t-1", "u-dev", "Какой браузер?")
     await bot.refresh("t-1")
-    status, question = tg.sent[-2], tg.sent[-1]
-    assert status["message_thread_id"] == 500 and status["text"].endswith("В работе.")
-    assert question["message_thread_id"] == 500 and "На каком филиале?" in question["text"]
+    assert tg.last(ANNA)["message_thread_id"] == 700 and "Какой браузер?" in tg.last(ANNA)["text"]
+    await bot.handle(in_topic(ANNA, 700, "/new"))
+    assert "начните новую тему" in tg.last(ANNA)["text"]
+    await bot.handle(in_topic(ANNA, 700, MINE))
+    assert "ID-1" in tg.last(ANNA)["text"] and not buttons(tg.last(ANNA))
 
-    # Written in the topic: goes to the ticket, the answer comes back into the topic.
-    await bot.handle(in_topic(ANNA, 500, "На Невском"))
-    assert yg.chats["t-1"][-1]["text"].endswith("На Невском")
-    assert tg.last(ANNA)["message_thread_id"] == 500
-    assert "Передал в заявку" in tg.last(ANNA)["text"]
-
-    # The menu still works from inside a topic, and answers there.
-    await bot.handle(in_topic(ANNA, 500, MINE))
-    assert "ID-1" in tg.last(ANNA)["text"] and tg.last(ANNA)["message_thread_id"] == 500
+    sent = [m for m in tg.sent[start:] if m["chat_id"] == ANNA]
+    assert sent and all(m.get("message_thread_id") == 700 for m in sent), "nothing outside topics"
+    assert all(m.get("reply_markup") != MENU for m in sent), "no menu keyboard in topics"
 
     yg.tasks["t-1"]["columnId"] = "c-done"
     await bot.refresh("t-1")
-    assert tg.topics[500] == "✅ ID-1 · Не приходят уведомления"  # kept as history, marked
-    yg.tasks["t-1"]["columnId"] = "c-work"  # reopened
-    await bot.refresh("t-1")
-    assert tg.topics[500] == "ID-1 · Не приходят уведомления"
-    yg.tasks["t-1"]["deleted"] = True
-    await bot.refresh("t-1")
-    assert tg.topics[500] == "✖ ID-1 · Не приходят уведомления"
+    assert tg.topics[700] == "✅ ID-1 · Не приходят уведомления"  # kept as history, marked
 
 
-async def test_a_new_ticket_written_inside_a_topic_is_not_sent_to_that_topics_ticket(
-    bot, store, tg, yg
-):
+async def test_drafts_in_two_topics_and_a_cancelled_one(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await bot.handle(in_topic(ANNA, 701, "Первая"))
+    await bot.handle(in_topic(ANNA, 702, "Вторая"))
+    await bot.handle(tap_in(ANNA, "cancel:701", 701))
+    assert 701 in tg.deleted_topics and await store.draft(ANNA, 701) == {}
+    await bot.handle(tap_in(ANNA, "send:702", 702))
+    assert [t["title"] for t in yg.tasks.values()] == ["Вторая"]
+    await bot.handle(tap_in(ANNA, "send:701", 701))  # cancelled: nothing
+    assert len(yg.tasks) == 1
+
+
+async def test_access_in_topic_mode(bot, store, tg, yg):
+    tg.topics_on = True
+    a = await account(store)
+    await bot.handle(in_topic(EVE, 900, "/start"))
+    assert tg.last(EVE)["message_thread_id"] == 900 and "Как вас зовут" in tg.last(EVE)["text"]
+    await bot.handle(in_topic(EVE, 900, "Ева, Подружки"))
+    request = tg.last(ADMIN)
+    thread = request["message_thread_id"]
+    assert tg.topics[thread] == "🔑 Запросы доступа"
+    await bot.handle(tap_in(ADMIN, f"ok:{EVE}:{a.id}:p-client", thread))
+    told = tg.last(EVE)
+    assert told["message_thread_id"] == 900 and "Доступ открыт" in told["text"]
+    assert "новую тему" in told["text"] and told["reply_markup"] == {"remove_keyboard": True}
+
+    await bot.handle(in_topic(ANNA, 901, "/start"))  # the next request: the same topic
+    await bot.handle(in_topic(ANNA, 901, "Анна"))
+    assert tg.last(ADMIN)["message_thread_id"] == thread
+    assert list(tg.topics.values()).count("🔑 Запросы доступа") == 1
+    tg.dead_threads.add(thread)  # the approver deleted the topic: a new one is made
+    await bot.handle(in_topic(200 + 1, 902, "/start"))
+    await bot.handle(in_topic(200 + 1, 902, "Кто-то"))
+    assert tg.last(ADMIN)["message_thread_id"] not in (None, thread)
+
+
+async def test_topics_with_the_old_main_chat_flow(bot, store, tg, yg):
+    """A message outside topics while topics are on (an old client, say): the ticket still
+    gets a topic of its own."""
     tg.topics_on = True
     await approved(bot, store, tg)
     await ticket(bot, tg)
-    before = len(yg.chats["t-1"])
-    await bot.handle(in_topic(ANNA, 500, NEW))
-    await bot.handle(in_topic(ANNA, 500, "Второй вопрос"))
-    await bot.handle(in_topic(ANNA, 500, "Подробности"))
-    await bot.handle(tap(ANNA, "send"))
-    assert len(yg.chats["t-1"]) == before
-    assert yg.tasks["t-2"]["title"] == "Второй вопрос"
-    assert tg.topics[501] == "ID-2 · Второй вопрос"
+    thread = (await store.ticket("t-1")).tg_thread_id
+    assert tg.topics[thread] == "ID-1 · Не приходят уведомления"
+    yg.tasks["t-1"]["deleted"] = True
+    await bot.refresh("t-1")
+    assert tg.topics[thread] == "✖ ID-1 · Не приходят уведомления"
 
 
 async def test_without_topics_the_main_chat_is_used(bot, store, tg, yg):
@@ -583,8 +657,9 @@ async def test_without_topics_the_main_chat_is_used(bot, store, tg, yg):
 async def test_a_topic_telegram_lost_falls_back_to_the_main_chat(bot, store, tg, yg):
     tg.topics_on = True
     await approved(bot, store, tg)
-    await ticket(bot, tg)
-    tg.dead_threads.add(500)
+    await bot.handle(in_topic(ANNA, 700, "Вопрос по входу"))
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    tg.dead_threads.add(700)
     yg.message("t-1", "u-dev", "Вопрос")
     await bot.refresh("t-1")
     last = tg.last(ANNA)

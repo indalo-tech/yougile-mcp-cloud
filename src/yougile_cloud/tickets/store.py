@@ -38,6 +38,7 @@ class Sender:
     name: str
     username: str
     status: str
+    tg_thread_id: int | None = None  # the topic they asked for access in
 
     @property
     def approved(self) -> bool:
@@ -79,6 +80,7 @@ def _sender(row: dict) -> Sender:
         name=row["name"],
         username=row["username"],
         status=row["status"],
+        tg_thread_id=row["tg_thread_id"],
     )
 
 
@@ -161,18 +163,22 @@ class TicketStore:
         )
         return _sender(row) if row else None
 
-    async def request_access(self, tg_user_id: int, name: str, username: str) -> Sender:
+    async def request_access(
+        self, tg_user_id: int, name: str, username: str, thread: int | None = None
+    ) -> Sender:
         """Record (or renew) a request; an approved or blocked sender keeps their status."""
         row = await self.db._one(
             """
-            INSERT INTO ticket_senders (tg_user_id, name, username) VALUES (%s, %s, %s)
+            INSERT INTO ticket_senders (tg_user_id, name, username, tg_thread_id)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (tg_user_id) DO UPDATE SET
                 name = EXCLUDED.name, username = EXCLUDED.username,
+                tg_thread_id = EXCLUDED.tg_thread_id,
                 status = CASE WHEN ticket_senders.status = 'rejected' THEN 'pending'
                               ELSE ticket_senders.status END
             RETURNING *
             """,
-            (tg_user_id, name, username),
+            (tg_user_id, name, username, thread),
         )
         assert row is not None
         return _sender(row)
@@ -299,24 +305,53 @@ class TicketStore:
         )
         return row["task_id"] if row else None
 
-    async def draft(self, tg_user_id: int) -> dict[str, Any]:
+    async def draft(self, tg_user_id: int, thread: int | None = None) -> dict[str, Any]:
+        """A conversation in progress: in a topic, or (thread None) the person's own one."""
         row = await self.db._one(
-            "SELECT state FROM ticket_drafts WHERE tg_user_id = %s "
+            "SELECT state FROM ticket_drafts WHERE tg_user_id = %s AND thread = %s "
             "AND updated_at > now() - interval '2 days'",
-            (tg_user_id,),
+            (tg_user_id, thread or 0),
         )
         return dict(row["state"]) if row else {}
 
-    async def save_draft(self, tg_user_id: int, state: dict[str, Any]) -> None:
+    async def save_draft(
+        self, tg_user_id: int, state: dict[str, Any], thread: int | None = None
+    ) -> None:
         if not state:
-            await self.db._exec("DELETE FROM ticket_drafts WHERE tg_user_id = %s", (tg_user_id,))
+            await self.db._exec(
+                "DELETE FROM ticket_drafts WHERE tg_user_id = %s AND thread = %s",
+                (tg_user_id, thread or 0),
+            )
             return
         await self.db._exec(
             """
-            INSERT INTO ticket_drafts (tg_user_id, state) VALUES (%s, %s)
-            ON CONFLICT (tg_user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = now()
+            INSERT INTO ticket_drafts (tg_user_id, thread, state) VALUES (%s, %s, %s)
+            ON CONFLICT (tg_user_id, thread) DO UPDATE SET
+                state = EXCLUDED.state, updated_at = now()
             """,
-            (tg_user_id, Jsonb(state)),
+            (tg_user_id, thread or 0, Jsonb(state)),
+        )
+
+    async def drop_drafts(self, tg_user_id: int) -> None:
+        """Every draft of a person (moved to another project: they were for the old one)."""
+        await self.db._exec("DELETE FROM ticket_drafts WHERE tg_user_id = %s", (tg_user_id,))
+
+    async def admin_topic(self, tg_user_id: int) -> int | None:
+        row = await self.db._one(
+            "SELECT thread FROM ticket_admin_topics WHERE tg_user_id = %s", (tg_user_id,)
+        )
+        return row["thread"] if row else None
+
+    async def set_admin_topic(self, tg_user_id: int, thread: int | None) -> None:
+        if thread is None:
+            await self.db._exec(
+                "DELETE FROM ticket_admin_topics WHERE tg_user_id = %s", (tg_user_id,)
+            )
+            return
+        await self.db._exec(
+            "INSERT INTO ticket_admin_topics (tg_user_id, thread) VALUES (%s, %s) "
+            "ON CONFLICT (tg_user_id) DO UPDATE SET thread = EXCLUDED.thread",
+            (tg_user_id, thread),
         )
 
     async def drop_stale_drafts(self) -> None:
