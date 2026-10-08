@@ -71,6 +71,7 @@ class FakeYouGile:
         self.keys: dict[str, tuple[str, str]] = {}  # key -> (company, user)
         self.deleted: list[str] = []
         self.calls: list[tuple[str, str]] = []
+        self.webhooks: list[dict] = []
 
     def _user(self, user: str) -> dict:
         return {
@@ -129,6 +130,14 @@ class FakeYouGile:
         }
         if path in lists:
             return httpx2.Response(200, json={"paging": {"next": False}, "content": lists[path]})
+        if path == "/webhooks" and request.method == "GET":
+            return httpx2.Response(200, json=self.webhooks)
+        if path == "/webhooks" and request.method == "POST":
+            if not self.admins.get(user, False):
+                return httpx2.Response(403, json={"error": "Forbidden"})
+            hook = {"id": f"w{len(self.webhooks)}", "disabled": False, "lastSuccess": 0, **body}
+            self.webhooks.append(hook)
+            return httpx2.Response(201, json={"id": hook["id"]})
         return httpx2.Response(404, json={"error": f"fake: {request.method} {path}"})
 
 

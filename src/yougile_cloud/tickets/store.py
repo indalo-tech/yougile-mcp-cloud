@@ -23,6 +23,13 @@ class Account:
 
 
 @dataclass(frozen=True)
+class BotConfig:
+    token_enc: bytes | None
+    bot_username: str
+    admins: frozenset[int]
+
+
+@dataclass(frozen=True)
 class Sender:
     tg_user_id: int
     account_id: int | None
@@ -83,18 +90,53 @@ class TicketStore:
     def __init__(self, db: Database) -> None:
         self.db = db
 
+    # ---------- bot settings ----------
+
+    async def bot_config(self) -> BotConfig | None:
+        row = await self.db._one("SELECT * FROM ticket_bot WHERE id = 1")
+        if row is None:
+            return None
+        token = row["token_enc"]
+        return BotConfig(
+            bytes(token) if token is not None else None,
+            row["bot_username"],
+            frozenset(int(x) for x in row["admins"] or []),
+        )
+
+    async def save_bot_config(
+        self, *, admins: list[int], token_enc: bytes | None = None, bot_username: str | None = None
+    ) -> None:
+        """Save the approvers, and the token when one is given (None keeps the stored one)."""
+        await self.db._exec(
+            """
+            INSERT INTO ticket_bot (id, token_enc, bot_username, admins)
+            VALUES (1, %s, COALESCE(%s, ''), %s)
+            ON CONFLICT (id) DO UPDATE SET
+                token_enc = COALESCE(EXCLUDED.token_enc, ticket_bot.token_enc),
+                bot_username = COALESCE(%s, ticket_bot.bot_username),
+                admins = EXCLUDED.admins, updated_at = now()
+            """,
+            (token_enc, bot_username, admins, bot_username),
+        )
+
     # ---------- accounts ----------
+
+    async def account_of_company(self, company_id: str) -> Account | None:
+        row = await self.db._one(
+            "SELECT * FROM ticket_accounts WHERE company_id = %s", (company_id,)
+        )
+        return _account(row) if row else None
 
     async def add_account(
         self, *, name: str, company_id: str, bot_user_id: str, api_key_enc: bytes
     ) -> Account:
-        """Create an account or replace the key of the one with this name."""
+        """Create the company's account or replace its key (one account per company)."""
         row = await self.db._one(
             """
             INSERT INTO ticket_accounts (name, company_id, bot_user_id, api_key_enc)
             VALUES (%s, %s, %s, %s)
-            ON CONFLICT (name) DO UPDATE SET
-                company_id = EXCLUDED.company_id, bot_user_id = EXCLUDED.bot_user_id,
+            ON CONFLICT (company_id) DO UPDATE SET
+                name = EXCLUDED.name, bot_user_id = EXCLUDED.bot_user_id,
                 api_key_enc = EXCLUDED.api_key_enc
             RETURNING *
             """,

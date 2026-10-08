@@ -26,6 +26,9 @@ DONE = {
     "rights": "Права сотрудника сохранены.",
     "reset": "Личные права сброшены: действуют настройки компании.",
     "disconnect": "Сотрудник отключён от YouGile MCP.",
+    "tickets_telegram": "Сохранено. Бот подхватит изменения в течение 20 секунд.",
+    "tickets_account": "Учётка бота подключена.",
+    "tickets_hooks": "Подписки на события YouGile на месте.",
 }
 
 
@@ -45,6 +48,7 @@ class Frame:
     tz: ZoneInfo
     default_role: str
     company_denied: set[str]
+    tickets: bool = False  # the company runs the Telegram ticket bot (TICKETS_COMPANY_ID)
 
 
 @dataclass(frozen=True)
@@ -109,7 +113,9 @@ def _errors(errors: list[str]) -> str:
 
 
 def _shell(frame: Frame, current: str, title: str, body: str, done: str | None) -> str:
-    links = (("users", "/admin", "Сотрудники"), ("settings", "/admin/settings", "Настройки"))
+    links = [("users", "/admin", "Сотрудники"), ("settings", "/admin/settings", "Настройки")]
+    if frame.tickets:
+        links.append(("tickets", "/admin/tickets", "Бот заявок"))
     nav = "".join(
         f'<a href="{href}"{" aria-current=page" if key == current else ""}>{e(label)}</a>'
         for key, href, label in links

@@ -70,7 +70,8 @@ docker compose exec postgres psql -U yougile yougile
 
 ### Бот заявок
 
-Процесс `tickets` (порт `127.0.0.1:8101`, Caddy отдаёт ему `/tickets/hook/*`). Включение:
+Процесс `tickets` (порт `127.0.0.1:8101`, Caddy отдаёт ему `/tickets/hook/*`). Настраивается
+на странице `/admin/tickets` (в `.env` нужен только `TICKETS_COMPANY_ID`). Из консоли:
 
 ```bash
 cd /home/deploy/yougile-mcp-cloud
