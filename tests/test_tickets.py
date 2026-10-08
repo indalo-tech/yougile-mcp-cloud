@@ -767,3 +767,14 @@ async def test_service_messages_are_not_people(bot, store, tg):
     await bot.handle(created)
     assert len(tg.sent) == before
     assert await store.draft(8808924856) == {} and await store.draft(ANNA) == {}
+
+
+async def test_a_topic_message_without_the_topic_flag_still_counts(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await bot.handle(in_topic(ANNA, 700, "Вопрос по входу"))
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    reply = in_topic(ANNA, 700, "Ответ без флага")
+    del reply["message"]["is_topic_message"]
+    await bot.handle(reply)
+    assert yg.chats["t-1"][-1]["text"].endswith("Ответ без флага")

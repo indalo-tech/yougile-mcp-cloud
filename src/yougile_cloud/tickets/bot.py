@@ -119,9 +119,22 @@ def _size(item: dict) -> dict:
 
 
 def thread_of(msg: dict) -> int | None:
-    """The topic of a message in the private chat; None for the main one (General is 1)."""
-    thread = msg.get("message_thread_id") if msg.get("is_topic_message") else None
-    return thread if thread and thread != 1 else None
+    """The topic of a message in the private chat; None for the main one (General is 1).
+    Telegram does not always mark a private topic's messages with is_topic_message, so the
+    thread id alone counts."""
+    thread = msg.get("message_thread_id")
+    return thread if isinstance(thread, int) and thread != 1 else None
+
+
+def describe(msg: dict) -> str:
+    """What a message is, for the log — never what it says."""
+    kinds = [k for k in ("text", "caption", "photo", "document", "voice", "video") if k in msg]
+    service = [k for k in SERVICE_KEYS if k in msg]
+    return (
+        f"from={(msg.get('from') or {}).get('id')} thread={msg.get('message_thread_id')} "
+        f"topic={msg.get('is_topic_message')} reply={'reply_to_message' in msg} "
+        f"kinds={kinds} service={service}"
+    )
 
 
 SERVICE_KEYS = (
@@ -217,6 +230,7 @@ class TicketBot:
         token = _thread.set(thread_of(msg))
         try:
             if update.get("message"):
+                log.info("message %s", describe(msg))
                 if (
                     (msg.get("chat") or {}).get("type") == "private"
                     and msg.get("from")
