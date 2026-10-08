@@ -143,7 +143,10 @@ class TicketService:
         if self.bot is not None:
             if not admins:
                 log.warning("nobody approves senders: add approvers on the admin page")
+            changed = self.bot.admins != admins
             self.bot.admins = admins
+            if changed and self._polling and self._poller:
+                self._spawn(self.bot.setup())
 
     async def _stop_bot(self) -> None:
         if self._poller:
@@ -188,6 +191,7 @@ class TicketService:
         offset: int | None = None
         with contextlib.suppress(TelegramError):
             await tg.call("deleteWebhook")  # long polling and a webhook exclude each other
+        await bot.setup()
         while True:
             try:
                 updates = await tg.updates(offset)

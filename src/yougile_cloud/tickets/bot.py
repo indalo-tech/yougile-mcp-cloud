@@ -20,7 +20,21 @@ log = logging.getLogger(__name__)
 
 NEW = "📝 Новая заявка"
 MINE = "📋 Мои заявки"
-MENU = {"keyboard": [[{"text": NEW}, {"text": MINE}]], "resize_keyboard": True}
+MENU = {
+    "keyboard": [[{"text": NEW}, {"text": MINE}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+COMMANDS = [
+    {"command": "new", "description": "Новая заявка"},
+    {"command": "my", "description": "Мои заявки"},
+    {"command": "cancel", "description": "Отменить заявку, которую пишете"},
+]
+ADMIN_COMMANDS = [
+    *COMMANDS,
+    {"command": "senders", "description": "Сотрудники и их проекты"},
+    {"command": "id", "description": "Мой Telegram id"},
+]
 NO_MENU = {"remove_keyboard": True}
 DONE_COLUMNS = {"готово"}
 MAX_TITLE = 200
@@ -156,6 +170,19 @@ class TicketBot:
                 await self.on_callback(cq)
         finally:
             _thread.reset(token)
+
+    async def setup(self) -> None:
+        """The command menu next to the input field (approvers get theirs as well)."""
+        try:
+            await self.tg.call("setMyCommands", commands=COMMANDS)
+            for admin in self.admins:
+                await self.tg.call(
+                    "setMyCommands",
+                    commands=ADMIN_COMMANDS,
+                    scope={"type": "chat", "chat_id": admin},
+                )
+        except TelegramError as exc:
+            log.info("setMyCommands: %s", exc)
 
     async def reply(self, chat: int, text: str, *, markup: dict | None = None) -> dict:
         """Answer where the person wrote: in the topic they wrote in, if any."""

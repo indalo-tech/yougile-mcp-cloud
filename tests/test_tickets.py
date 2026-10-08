@@ -15,7 +15,7 @@ from starlette.requests import Request
 from yougile_cloud.crypto import Secrets
 from yougile_cloud.db import Database
 from yougile_cloud.settings import Settings
-from yougile_cloud.tickets.bot import MINE, NEW, TicketBot, attachment, ids_in
+from yougile_cloud.tickets.bot import MENU, MINE, NEW, TicketBot, attachment, ids_in
 from yougile_cloud.tickets.desk import Desks, text_html
 from yougile_cloud.tickets.service import TicketService, TicketSettings, hook_secret
 from yougile_cloud.tickets.store import TicketStore
@@ -668,3 +668,9 @@ def test_settings_from_env():
     s = TicketSettings.from_env({"TICKETS_BOT_TOKEN": " x ", "TICKETS_ADMINS": "1, 2"})
     assert s.bot_token == "x" and s.admins == frozenset({1, 2})
     assert TicketSettings.from_env({}).bot_token is None
+
+
+async def test_command_menu_and_a_keyboard_that_stays(bot, tg):
+    await bot.setup()
+    assert tg.calls.count("setMyCommands") == 2  # everyone, and the approver's own
+    assert MENU["is_persistent"] is True
