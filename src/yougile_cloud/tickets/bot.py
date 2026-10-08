@@ -133,7 +133,7 @@ def describe(msg: dict) -> str:
     return (
         f"from={(msg.get('from') or {}).get('id')} thread={msg.get('message_thread_id')} "
         f"topic={msg.get('is_topic_message')} reply={'reply_to_message' in msg} "
-        f"kinds={kinds} service={service}"
+        f"kinds={kinds} service={service} fields={sorted(msg)}"
     )
 
 
