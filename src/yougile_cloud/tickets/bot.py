@@ -124,6 +124,25 @@ def thread_of(msg: dict) -> int | None:
     return thread if thread and thread != 1 else None
 
 
+SERVICE_KEYS = (
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+    "pinned_message",
+    "new_chat_members",
+    "left_chat_member",
+)
+
+
+def is_service(msg: dict) -> bool:
+    """A message no person wrote: Telegram's notes about topics (renaming one included, which
+    comes «from» the bot itself), pins and the like, or anything from a bot."""
+    return bool((msg.get("from") or {}).get("is_bot")) or any(k in msg for k in SERVICE_KEYS)
+
+
 def first_line(text: str) -> str:
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
@@ -198,7 +217,11 @@ class TicketBot:
         token = _thread.set(thread_of(msg))
         try:
             if update.get("message"):
-                if (msg.get("chat") or {}).get("type") == "private" and msg.get("from"):
+                if (
+                    (msg.get("chat") or {}).get("type") == "private"
+                    and msg.get("from")
+                    and not is_service(msg)
+                ):
                     await self.on_message(msg)
             elif cq := update.get("callback_query"):
                 await self.on_callback(cq)

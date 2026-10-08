@@ -749,3 +749,21 @@ async def test_command_menu_and_a_keyboard_that_stays(bot, tg):
     await bot.setup()
     assert tg.calls.count("setMyCommands") == 2  # everyone, and the approver's own
     assert MENU["is_persistent"] is True
+
+
+async def test_service_messages_are_not_people(bot, store, tg):
+    """Renaming a topic makes Telegram send a «topic edited» note «from» the bot itself: it must
+    not be taken for a stranger and asked for a name."""
+    await account(store)
+    before = len(tg.sent)
+    note = in_topic(8808924856, 700, "")
+    del note["message"]["text"]
+    note["message"]["from"] |= {"is_bot": True}
+    note["message"]["forum_topic_edited"] = {"name": "ID-1 · Тест"}
+    await bot.handle(note)
+    created = in_topic(ANNA, 701, "")
+    del created["message"]["text"]
+    created["message"]["forum_topic_created"] = {"name": "Новая тема", "icon_color": 0}
+    await bot.handle(created)
+    assert len(tg.sent) == before
+    assert await store.draft(8808924856) == {} and await store.draft(ANNA) == {}
