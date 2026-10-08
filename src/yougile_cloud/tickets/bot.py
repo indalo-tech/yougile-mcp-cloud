@@ -45,6 +45,9 @@ TOPICS_RECHECK = 600.0  # seconds between checks that the bot's topics are on (@
 
 # The topic the message being handled came from: answers go back there.
 _thread: ContextVar[int | None] = ContextVar("ticket_bot_thread", default=None)
+# The message being handled: with topics on, a message that came without a topic (one written
+# in a topic the bot made) is answered as a reply to it, which keeps the answer in its topic.
+_incoming: ContextVar[int | None] = ContextVar("ticket_bot_incoming", default=None)
 
 ASK_NAME = (
     "Здравствуйте! Это бот для заявок команде Indalo.\n\n"
@@ -65,6 +68,10 @@ THREAD_HELP = (
     "случилось: текстом, фото, голосовым, можно в несколько сообщений. Перед отправкой я покажу "
     "черновик.\n\nВсё по заявке — в её теме: статус, вопросы команды. Пишите туда, сообщения "
     "уйдут в заявку."
+)
+NO_TOPIC = (
+    "Не понял, к какой заявке это сообщение. Чтобы написать по заявке, ответьте на сообщение "
+    "бота о ней (свайп влево по сообщению). Новая заявка — новая тема (✏️ или «Новая тема»)."
 )
 TOPIC_COMMANDS = [{"command": "my", "description": "Мои заявки"}]
 TOPIC_ADMIN_COMMANDS = [
@@ -228,6 +235,7 @@ class TicketBot:
     async def handle(self, update: dict) -> None:
         msg = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
         token = _thread.set(thread_of(msg))
+        incoming = _incoming.set(msg.get("message_id") if update.get("message") else None)
         try:
             if update.get("message"):
                 log.info("message %s", describe(msg))
@@ -241,6 +249,7 @@ class TicketBot:
                 await self.on_callback(cq)
         finally:
             _thread.reset(token)
+            _incoming.reset(incoming)
 
     async def setup(self) -> None:
         """The command menu next to the input field (approvers get theirs as well)."""
@@ -260,12 +269,14 @@ class TicketBot:
         """Answer where the person wrote: in the topic they wrote in, if any (topics have no
         menu keyboard: a new topic is the way to a new ticket)."""
         thread = _thread.get()
-        if thread and markup is MENU:
+        topics = thread is not None or await self.topics_enabled()
+        if topics and markup is MENU:
             markup = NO_MENU
+        reply_to = _incoming.get() if topics and thread is None else None
         try:
-            return await self.tg.send(chat, text, markup=markup, thread=thread)
+            return await self.tg.send(chat, text, markup=markup, thread=thread, reply_to=reply_to)
         except TelegramError as exc:
-            if not thread or exc.code != 400:
+            if not (thread or reply_to) or exc.code != 400:
                 raise
             return await self.tg.send(chat, text, markup=markup)
 
@@ -298,6 +309,9 @@ class TicketBot:
         thread = thread_of(msg)
         if thread is not None:
             await self.in_topic(msg, sender, thread, text)
+            return
+        if await self.topics_enabled():
+            await self.unplaced(msg, sender, text)
             return
         draft = await self.store.draft(uid)
 
@@ -354,6 +368,22 @@ class TicketBot:
             await self.cancel_topic(chat, uid, thread)
             return
         await self.compose(chat, uid, thread, msg, text)
+
+    async def unplaced(self, msg: dict, sender: Sender, text: str) -> None:
+        """Topics on, yet no topic on the message: it was written in a topic the bot made (those
+        come without their thread id). A reply to a message about a ticket still finds it."""
+        chat = msg["chat"]["id"]
+        if text in ("/my", MINE):
+            await self.list_tickets(chat, sender.tg_user_id)
+            return
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        if reply_to and (task_id := await self.store.ticket_of_message(chat, reply_to)):
+            await self.relay(sender, msg, task_id)
+            return
+        if text in ("/start", "/help", "/menu", "/new", NEW):
+            await self.reply(chat, THREAD_HELP, markup=NO_MENU)
+            return
+        await self.reply(chat, NO_TOPIC, markup=NO_MENU)
 
     async def compose(self, chat: int, uid: int, thread: int, msg: dict, text: str) -> None:
         content = text or (msg.get("caption") or "").strip()
@@ -783,25 +813,6 @@ class TicketBot:
                 return
             task, number, failed = made
             note = f"\n\nНе удалось приложить: {esc(', '.join(failed))}." if failed else ""
-            thread = await self.open_topic(chat, topic_name(number, title))
-            if thread:
-                await self.store.update_ticket(task["id"], tg_thread_id=thread)
-                thread = await self.say(
-                    chat,
-                    task["id"],
-                    f"✅ Заявка <b>{esc(number)}</b> принята: «{esc(title)}».\n"
-                    f"Здесь — всё по ней: статус, вопросы команды. Пишите сюда, "
-                    f"сообщения уйдут в заявку.{note}",
-                    thread=thread,
-                )
-            if thread:
-                await self.reply(
-                    chat,
-                    f"✅ Заявка <b>{esc(number)}</b> принята. Переписка по ней — в отдельной "
-                    f"теме «{esc(topic_name(number, title))}».",
-                    markup=MENU,
-                )
-                return
             await self.say(
                 chat,
                 task["id"],
@@ -812,7 +823,8 @@ class TicketBot:
             await self.reply(chat, "Что-то ещё?", markup=MENU)
 
     async def open_topic(self, chat: int, name: str) -> int | None:
-        """A topic for a ticket in the sender's chat, or None (topics off or refused)."""
+        """A topic the bot makes (the approvers' one), or None (topics off or refused). Not for
+        tickets: messages written in a topic the bot made reach it without their thread id."""
         if not await self.topics_enabled():
             return None
         try:
@@ -898,12 +910,8 @@ class TicketBot:
             except TelegramError as exc:
                 log.info("setMessageReaction: %s", exc)
         note = " Файл приложить не удалось." if failed else ""
-        await self.say(
-            chat,
-            task_id,
-            f"Передал в заявку <b>{esc(ticket.number)}</b>.{note}",
-            thread=_thread.get(),
-        )
+        sent = await self.reply(chat, f"Передал в заявку <b>{esc(ticket.number)}</b>.{note}")
+        await self.store.link_message(chat, sent["message_id"], task_id)
 
     async def list_tickets(self, chat: int, uid: int) -> None:
         tickets = await self.store.tickets_of(uid)

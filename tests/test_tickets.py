@@ -632,26 +632,34 @@ async def test_access_in_topic_mode(bot, store, tg, yg):
     assert tg.last(ADMIN)["message_thread_id"] not in (None, thread)
 
 
-async def test_topics_with_the_old_main_chat_flow(bot, store, tg, yg):
-    """A message outside topics while topics are on (an old client, say): the ticket still
-    gets a topic of its own."""
+async def test_with_topics_a_message_outside_them_is_answered_in_place(bot, store, tg, yg):
+    """Messages written in a topic the bot made come without a thread id: the answer is a
+    reply to the message (so it stays in that topic), and a reply to a message about a
+    ticket still reaches the ticket."""
     tg.topics_on = True
     await approved(bot, store, tg)
-    await ticket(bot, tg)
-    thread = (await store.ticket("t-1")).tg_thread_id
-    assert tg.topics[thread] == "ID-1 · Не приходят уведомления"
-    yg.tasks["t-1"]["deleted"] = True
+    await bot.handle(in_topic(ANNA, 700, "Вопрос по входу"))
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    yg.message("t-1", "u-dev", "Какой браузер?")
     await bot.refresh("t-1")
-    assert tg.topics[thread] == "✖ ID-1 · Не приходят уведомления"
+    question = tg.next_id
 
+    stray = text(ANNA, "Хром")
+    await bot.handle(stray)
+    answer = tg.last(ANNA)
+    assert "Не понял, к какой заявке" in answer["text"]
+    assert answer["reply_parameters"]["message_id"] == stray["message"]["message_id"]
+    assert answer["reply_markup"] == {"remove_keyboard": True}
+    assert not yg.chats["t-1"][-1]["text"].endswith("Хром")
 
-async def test_without_topics_the_main_chat_is_used(bot, store, tg, yg):
-    tg.topics_on, tg.refuse_topics = True, True
-    await approved(bot, store, tg)
-    await ticket(bot, tg)
-    assert (await store.ticket("t-1")).tg_thread_id is None
-    accepted = [m for m in tg.sent if "принята" in m["text"]][-1]
-    assert buttons(accepted) == ["reply:t-1"] and "message_thread_id" not in accepted
+    await bot.handle(text(ANNA, "Хром", reply_to_message={"message_id": question}))
+    assert yg.chats["t-1"][-1]["text"].endswith("Хром")
+    await bot.handle(text(ANNA, NEW))  # the old keyboard: explained, not a draft
+    assert "начните новую тему" in tg.last(ANNA)["text"]
+    assert await store.draft(ANNA) == {}
+    # The only topic the bot made is the approver's; the ticket's topic is the person's own.
+    assert tg.calls.count("createForumTopic") == 1
+    assert list(tg.topics.values()).count("🔑 Запросы доступа") == 1
 
 
 async def test_a_topic_telegram_lost_falls_back_to_the_main_chat(bot, store, tg, yg):

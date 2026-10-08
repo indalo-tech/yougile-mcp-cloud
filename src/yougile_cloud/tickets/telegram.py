@@ -56,10 +56,17 @@ class Telegram:
         raise AssertionError("unreachable")
 
     async def send(
-        self, chat_id: int, text: str, *, markup: dict | None = None, thread: int | None = None
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        markup: dict | None = None,
+        thread: int | None = None,
+        reply_to: int | None = None,
     ) -> dict:
-        """An HTML message, into a topic when ``thread`` is given; the caller escapes what
-        came from people."""
+        """An HTML message, into a topic when ``thread`` is given, as a reply to ``reply_to``
+        (which also keeps it in that message's topic); the caller escapes what came from
+        people."""
         return await self.call(
             "sendMessage",
             chat_id=chat_id,
@@ -68,6 +75,9 @@ class Telegram:
             parse_mode="HTML",
             link_preview_options={"is_disabled": True},
             reply_markup=markup,
+            reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True}
+            if reply_to
+            else None,
         )
 
     async def download(self, file_id: str) -> bytes:
