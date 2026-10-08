@@ -582,7 +582,7 @@ async def test_in_topic_mode_a_new_topic_is_a_new_ticket(bot, store, tg, yg):
     await bot.refresh("t-1")
     assert tg.last(ANNA)["message_thread_id"] == 700 and "Какой браузер?" in tg.last(ANNA)["text"]
     await bot.handle(in_topic(ANNA, 700, "/new"))
-    assert "начните новую тему" in tg.last(ANNA)["text"]
+    assert "Как пользоваться ботом" in tg.last(ANNA)["text"]
     await bot.handle(in_topic(ANNA, 700, MINE))
     assert "ID-1" in tg.last(ANNA)["text"] and not buttons(tg.last(ANNA))
 
@@ -620,7 +620,9 @@ async def test_access_in_topic_mode(bot, store, tg, yg):
     await bot.handle(tap_in(ADMIN, f"ok:{EVE}:{a.id}:p-client", thread))
     told = tg.last(EVE)
     assert told["message_thread_id"] == 900 and "Доступ открыт" in told["text"]
-    assert "новую тему" in told["text"] and told["reply_markup"] == {"remove_keyboard": True}
+    assert "Как пользоваться ботом" in told["text"] and told["reply_markup"] == {
+        "remove_keyboard": True
+    }
 
     await bot.handle(in_topic(ANNA, 901, "/start"))  # the next request: the same topic
     await bot.handle(in_topic(ANNA, 901, "Анна"))
@@ -655,7 +657,7 @@ async def test_with_topics_a_message_outside_them_is_answered_in_place(bot, stor
     await bot.handle(text(ANNA, "Хром", reply_to_message={"message_id": question}))
     assert yg.chats["t-1"][-1]["text"].endswith("Хром")
     await bot.handle(text(ANNA, NEW))  # the old keyboard: explained, not a draft
-    assert "начните новую тему" in tg.last(ANNA)["text"]
+    assert "Как пользоваться ботом" in tg.last(ANNA)["text"]
     assert await store.draft(ANNA) == {}
     # The only topic the bot made is the approver's; the ticket's topic is the person's own.
     assert tg.calls.count("createForumTopic") == 1
@@ -756,6 +758,7 @@ def test_settings_from_env():
 async def test_command_menu_and_a_keyboard_that_stays(bot, tg):
     await bot.setup()
     assert tg.calls.count("setMyCommands") == 2  # everyone, and the approver's own
+    assert "setMyDescription" in tg.calls and "setMyShortDescription" in tg.calls
     assert MENU["is_persistent"] is True
 
 
