@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from conftest import admin_login, connect, field
+from conftest import admin_login, connect, field, register_client, sign_in, start_flow
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -266,3 +266,111 @@ async def test_client_copies_setting_reaches_mcp_sessions(server, settings, http
         overview = (await c.call_tool("yougile_overview", {})).data
     assert {"yougile_client_copy", "yougile_client_copies"} <= tools
     assert overview["client_copy"] == {"from": "Проект", "to": "Клиенты", "rules": "Коротко"}
+
+
+async def test_company_default_board(server, settings, http):
+    _, bob = await connect(http, settings, login="bob@example.com", password="pw")
+    await admin_login(http, settings)
+    page = await http.get("/admin/settings")
+    assert '<option value="b1">Проект / Доска</option>' in page.text
+
+    def form(board: str) -> dict:
+        return {
+            "csrf": field(page.text, "csrf"),
+            "default_role": "member",
+            "timezone": "Europe/Moscow",
+            "board": board,
+        }
+
+    resp = await http.post("/admin/settings", data=form("b-nope"), headers=origin(settings))
+    assert resp.status_code == 400 and "Выберите доску по умолчанию" in resp.text
+    resp = await http.post("/admin/settings", data=form("b1"), headers=origin(settings))
+    assert resp.status_code == 303
+    assert (await server.db.get_company("c-main")).settings["board"] == "b1"
+    assert "Проект / Доска — по умолчанию компании" in (await http.get("/admin/users/u-bob")).text
+
+    server.tenancy._cache.clear()
+    async with mcp(settings, bob["access_token"]) as c:
+        overview = (await c.call_tool("yougile_overview", {})).data
+        assert overview["defaults"]["board"] == "Проект / Доска", "a name, not the id"
+        assert "default board under Настройки" in overview["settings_in"]
+
+    bob_user = next(u for u in await server.db.list_users("c-main") if u.yougile_user_id == "u-bob")
+    await server.db.set_default_board(bob_user.id, "b1")
+    assert "Проект / Доска — выбрал сам" in (await http.get("/admin/users/u-bob")).text
+
+    resp = await http.post("/admin/settings", data=form(""), headers=origin(settings))
+    assert resp.status_code == 303
+    assert "board" not in (await server.db.get_company("c-main")).settings
+
+    # a board that is gone shows as such instead of silently pointing nowhere
+    company = await server.db.get_company("c-main")
+    await server.db.save_company_settings("c-main", {**company.settings, "board": "b-gone"})
+    assert "доска удалена или скрыта" in (await http.get("/admin/settings")).text
+
+
+async def test_a_banned_person_cannot_connect(server, settings, http, fake):
+    _, bob = await connect(http, settings, login="bob@example.com", password="pw")
+    bob_key = next(k for k, (_, user) in fake.keys.items() if user == "u-bob")
+    await admin_login(http, settings)
+    page = await http.get("/admin/users/u-bob")
+    assert "Запретить подключение" in page.text
+
+    resp = await http.post(
+        "/admin/users/u-bob/block",
+        data={"csrf": field(page.text, "csrf")},
+        headers=origin(settings),
+    )
+    assert resp.status_code == 303 and resp.headers["location"] == "/admin/users/u-bob?done=blocked"
+    assert bob_key in fake.deleted, "banning disconnects"
+    assert "u-bob" not in [u.yougile_user_id for u in await server.db.list_users("c-main")]
+    assert "подключение запрещено" in (await http.get("/admin")).text
+
+    client_id = await register_client(http)
+    signin_path, _ = await start_flow(http, settings, client_id)
+    resp = await sign_in(http, settings, signin_path, login="bob@example.com", password="pw")
+    assert resp.status_code == 403 and "закрыл вам подключение" in resp.text
+    assert not [k for k, (_, user) in fake.keys.items() if user == "u-bob"], "the new key is gone"
+    assert "u-bob" not in [u.yougile_user_id for u in await server.db.list_users("c-main")]
+
+    page = await http.get("/admin/users/u-bob")
+    await http.post(
+        "/admin/users/u-bob/reset",
+        data={"csrf": field(page.text, "csrf")},
+        headers=origin(settings),
+    )
+    assert (await server.db.get_rights("c-main", "u-bob")).blocked, "a reset keeps the ban"
+
+    page = await http.get("/admin/users/u-bob")
+    assert "Разрешить подключение" in page.text
+    resp = await http.post(
+        "/admin/users/u-bob/unblock",
+        data={"csrf": field(page.text, "csrf")},
+        headers=origin(settings),
+    )
+    assert resp.headers["location"] == "/admin/users/u-bob?done=unblocked"
+    await connect(http, settings, login="bob@example.com", password="pw")  # in again
+
+
+async def test_admins_are_never_banned(server, settings, http):
+    await admin_login(http, settings)
+    page = await http.get("/admin/users/u-anna")
+    assert "Запретить подключение" not in page.text
+    resp = await http.post(
+        "/admin/users/u-anna/block",
+        data={"csrf": field(page.text, "csrf")},
+        headers=origin(settings),
+    )
+    assert resp.status_code == 400 and "Администратору компании" in resp.text
+    assert await server.db.get_rights("c-main", "u-anna") is None
+
+
+async def test_a_ban_stops_a_session_already_running(server, settings, http):
+    _, bob = await connect(http, settings, login="bob@example.com", password="pw")
+    async with mcp(settings, bob["access_token"]) as c:
+        assert not (await c.call_tool("yougile_overview", {}, raise_on_error=False)).is_error
+        # banned straight in the database (a sign-in under way when the admin banned)
+        await server.db.set_blocked("c-main", "u-bob", True)
+        server.tenancy._cache.clear()
+        result = await c.call_tool("yougile_overview", {}, raise_on_error=False)
+        assert result.is_error and "закрыл вам подключение" in str(result.content)

@@ -35,6 +35,7 @@ COMPANY_KEYS = (
     "workflows",
     "done_columns",
     "client_copy",
+    "board",  # the company's default board (an id); a person's own choice wins
 )
 
 
@@ -101,8 +102,8 @@ class Tenancy:
             Directory(client),
             allow_local_files=False,
             settings_hint=f"the company admin page {self.settings.public_url}/admin "
-            "(company admins only: people's rights are under Сотрудники, company rules and "
-            "Workflow chains under Настройки)",
+            "(company admins only: people's rights are under Сотрудники, company rules, "
+            "Workflow chains and the default board under Настройки)",
             board=user.default_board,
             save_board=lambda board: self.db.set_default_board(user.id, board),
         )
@@ -117,6 +118,10 @@ class Tenancy:
         access = access_of(company, self.settings.free_company_ids)
         if not access.allowed:
             raise ToolError(access.message())
+        if rights and rights.blocked and not user.is_admin:
+            # Banning disconnects the person too; this covers a sign-in that was under way.
+            self.forget(user_id)
+            raise ToolError("Администратор компании закрыл вам подключение к YouGile MCP.")
         await self.db.touch_user(user.id)  # "last seen" for the admin page, once per RECHECK
         version = (user.updated_at, company.settings_version, rights.updated_at if rights else None)
         async with self._lock:
