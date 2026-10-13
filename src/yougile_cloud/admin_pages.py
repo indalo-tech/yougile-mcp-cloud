@@ -401,6 +401,8 @@ def user_page(
     connection = (
         f"<p>Подключение к YouGile MCP: {_mcp_cell(person, frame.tz)}</p>"
         if person.user
+        else '<p class="muted">Не подключён к YouGile MCP.</p>'
+        if blocked
         else '<p class="muted">Подключения к YouGile MCP ещё не было. Права начнут действовать '
         "с первого подключения.</p>"
     )
