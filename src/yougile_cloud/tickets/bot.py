@@ -44,6 +44,7 @@ MAX_TEXT = 3500  # Telegram allows 4096 characters per message
 MAX_TOPIC = 128  # characters in a topic's name
 TOPICS_RECHECK = 600.0  # seconds between checks that the bot's topics are on (@BotFather)
 REASK_AFTER = 600  # seconds: a pending person writing again re-sends the access request
+REJECTED_QUIET = 86_400  # seconds: a refused person cannot ask again sooner
 
 # The topic the message being handled came from: answers go back there.
 _thread: ContextVar[int | None] = ContextVar("ticket_bot_thread", default=None)
@@ -270,6 +271,11 @@ class TicketBot:
         # Tickets whose last report failed (Telegram unreachable): tried again every minute
         # by the service, until it goes through. A restart leaves it to the regular check.
         self.pending: set[str] = set()
+        # Webhooks come in bursts (an edit is several events): one refresh per task at a time,
+        # and one more if events arrived meanwhile — not one per event.
+        self._busy: set[str] = set()
+        self._dirty: dict[str, bool] = {}  # task id -> the rerun needs the chat too
+        self._fresh: dict[str, float] = {}  # task id -> last successful refresh (monotonic)
 
     # ================= Telegram side =================
 
@@ -470,6 +476,10 @@ class TicketBot:
                 log.info("deleteMessage: %s", exc)
 
     async def cancel_topic(self, chat: int, uid: int, thread: int) -> None:
+        if await self.store.ticket_of_thread(chat, thread):
+            # An old card's «Отменить» after the ticket was made: the topic is the ticket's.
+            await self.reply(chat, "Заявка уже отправлена — её тема остаётся.")
+            return
         await self.store.save_draft(uid, {}, thread)
         try:
             await self.tg.call("deleteForumTopic", chat_id=chat, message_thread_id=thread)
@@ -603,6 +613,15 @@ class TicketBot:
         """Someone without access: ask who they are, pass the request to the approvers."""
         uid, chat = msg["from"]["id"], msg["chat"]["id"]
         if sender and sender.status == "blocked":
+            return
+        if (
+            sender
+            and sender.status == "rejected"
+            and sender.decided_at
+            and time.time() - sender.decided_at.timestamp() < REJECTED_QUIET
+        ):
+            # Refused today: no new request to the approvers on every message.
+            await self.reply(chat, "В доступе отказано. Попробовать снова можно завтра.")
             return
         if sender and sender.status == "pending":
             # The request may never have reached an approver (Telegram down at the time) or
@@ -1004,8 +1023,8 @@ class TicketBot:
             try:
                 sent = await self.tg.send(chat, text, thread=thread)
             except TelegramError as exc:
-                if exc.code != 400:
-                    raise
+                if not (exc.code == 400 and "thread" in exc.description.lower()):
+                    raise  # any other refusal (bad markup, say) is not the topic's fault
                 log.info("the topic of %s is unusable (%s): main chat instead", task_id, exc)
                 await self.store.update_ticket(task_id, tg_thread_id=None)
                 thread = None
@@ -1024,12 +1043,27 @@ class TicketBot:
         # The payload format is not documented: its shape (never its values) helps to see why.
         log.info("YouGile event %s %s: %d ticket(s)", name, shape(event), len(known))
         for task_id in known:
-            try:
-                await self.refresh(task_id, chat=not name.startswith("task-"))
-            except Exception:
-                log.exception("refreshing ticket %s failed", task_id)
-                self.pending.add(task_id)
+            await self.coalesced(task_id, chat=not name.startswith("task-"))
         return len(known)
+
+    async def coalesced(self, task_id: str, *, chat: bool) -> None:
+        """Refresh a ticket for an event; a refresh already running takes this event along."""
+        if task_id in self._busy:
+            self._dirty[task_id] = self._dirty.get(task_id, False) or chat
+            return
+        self._busy.add(task_id)
+        try:
+            while True:
+                try:
+                    await self.refresh(task_id, chat=chat)
+                except Exception:
+                    log.exception("refreshing ticket %s failed", task_id)
+                    self.pending.add(task_id)
+                if task_id not in self._dirty:
+                    break
+                chat = self._dirty.pop(task_id)
+        finally:
+            self._busy.discard(task_id)
 
     async def retry_pending(self) -> int:
         """Report again the tickets whose report failed; returns how many still fail."""
@@ -1041,10 +1075,21 @@ class TicketBot:
                 log.info("ticket %s still not reported: %s", task_id, exc)
         return len(self.pending)
 
-    async def refresh_open(self) -> int:
-        """Check every open ticket (webhooks can be lost); returns how many failed."""
+    async def refresh_open(self, fresh_within: float = 0.0, pause: float = 0.0) -> int:
+        """Check every open ticket (webhooks can be lost); returns how many failed. Tickets a
+        webhook refreshed within ``fresh_within`` seconds are skipped, and ``pause`` spreads
+        the rest out, so the check never crowds the company's shared limit."""
         failed = 0
-        for ticket in await self.store.open_tickets():
+        now = time.monotonic()
+        tickets = [
+            t
+            for t in await self.store.open_tickets()
+            if now - self._fresh.get(t.task_id, -1e18) >= fresh_within
+        ]
+        self._tidy()
+        for n, ticket in enumerate(tickets):
+            if pause and n:
+                await asyncio.sleep(pause)
             try:
                 await self.refresh(ticket.task_id)
                 self.pending.discard(ticket.task_id)
@@ -1054,10 +1099,22 @@ class TicketBot:
                 failed += 1
         return failed
 
+    def _tidy(self) -> None:
+        """Forget idle locks and old refresh times (they would pile up for every ticket)."""
+        for key in [k for k, lock in self._locks.items() if not lock.locked()]:
+            del self._locks[key]
+        horizon = time.monotonic() - 86_400
+        self._fresh = {k: v for k, v in self._fresh.items() if v > horizon}
+
     async def refresh(self, task_id: str, *, chat: bool = True) -> None:
         """Compare a ticket with its task and tell the sender what changed: the column (or
         completion, or removal) and new messages in the task's chat. A task that has left
         the customer's project is not reported at all."""
+        await self._refresh(task_id, chat=chat)
+        if chat:
+            self._fresh[task_id] = time.monotonic()
+
+    async def _refresh(self, task_id: str, *, chat: bool = True) -> None:
         async with self._locks[f"task:{task_id}"]:
             ticket = await self.store.ticket(task_id)
             if ticket is None or ticket.deleted:
@@ -1080,6 +1137,10 @@ class TicketBot:
                 return
             sender = await self.store.sender(ticket.tg_user_id)
             quiet = sender is None or not sender.approved  # blocked, rejected: told nothing
+            outside = column is None or column.project_id != ticket.project_id
+            if task.get("deleted") and outside:  # removed in another project: not the sender's news
+                await self.store.update_ticket(task_id, deleted=True)
+                return
             if task.get("deleted"):
                 if not quiet:  # told first, saved after: a failure is retried, not lost
                     await self.notify(
@@ -1149,7 +1210,7 @@ class TicketBot:
             author = esc(await desk.user_name(m.get("fromUserId") or ""))
             url = file_url(m)
             if url:
-                body = f'📎 <a href="{esc(desk.link(url))}">файл</a>'
+                body = f'📎 <a href="{html.escape(desk.link(url), quote=True)}">файл</a>'
             else:
                 body = esc(clip(message_text(m)))
             if not body:

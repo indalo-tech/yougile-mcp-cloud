@@ -39,6 +39,7 @@ class Sender:
     username: str
     status: str
     tg_thread_id: int | None = None  # the topic they asked for access in
+    decided_at: datetime | None = None
 
     @property
     def approved(self) -> bool:
@@ -81,6 +82,7 @@ def _sender(row: dict) -> Sender:
         username=row["username"],
         status=row["status"],
         tg_thread_id=row["tg_thread_id"],
+        decided_at=row.get("decided_at"),
     )
 
 
@@ -354,6 +356,15 @@ class TicketStore:
             "INSERT INTO ticket_admin_topics (tg_user_id, thread) VALUES (%s, %s) "
             "ON CONFLICT (tg_user_id) DO UPDATE SET thread = EXCLUDED.thread",
             (tg_user_id, thread),
+        )
+
+    async def prune_messages(self, days: int = 90) -> None:
+        """Telegram message links of tickets closed long ago: replies to such old messages no
+        longer need to find their ticket."""
+        await self.db._exec(
+            "DELETE FROM ticket_tg_messages m USING tickets t WHERE m.task_id = t.task_id "
+            "AND (t.completed OR t.deleted) AND t.created_at < now() - make_interval(days => %s)",
+            (days,),
         )
 
     async def drop_stale_drafts(self) -> None:

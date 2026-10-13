@@ -43,6 +43,7 @@ class FakeTelegram:
         self.reactions: list[dict] = []
         self.down = False  # Telegram unreachable: every call fails to connect
         self.fail_getme = False
+        self.bad_markup = False  # sendMessage refused for its HTML (not the topic's fault)
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
@@ -54,6 +55,11 @@ class FakeTelegram:
         self.calls.append(method)
         body = json.loads(request.content) if request.content else {}
         result: Any = True
+        if method == "sendMessage" and self.bad_markup:
+            return httpx2.Response(
+                400,
+                json={"ok": False, "error_code": 400, "description": "can't parse entities"},
+            )
         if method == "sendMessage" and body.get("message_thread_id") in self.dead_threads:
             return httpx2.Response(
                 400,
@@ -918,3 +924,91 @@ async def test_a_getme_blip_keeps_topics_on(bot, tg, no_connect_retries):
     tg.fail_getme = True
     bot._topics = (bot._topics[0] - 10_000, True)  # time to check again
     assert await bot.topics_enabled(), "a failed check keeps what was known"
+
+
+# ---------------- review, part 3 ----------------
+
+
+async def test_a_refused_message_keeps_the_ticket_in_its_topic(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await bot.handle(in_topic(ANNA, 700, "Вопрос"))
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    tg.bad_markup = True
+    yg.message("t-1", "u-dev", "Ответ")
+    await bot.refresh("t-1")  # refused for its markup: dropped, not retried, topic kept
+    assert (await store.ticket("t-1")).tg_thread_id == 700
+
+
+async def test_cancel_on_a_sent_tickets_topic_keeps_it(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await bot.handle(in_topic(ANNA, 700, "Вопрос"))
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    await bot.handle(tap_in(ANNA, "cancel:700", 700))  # the old card's button
+    assert 700 not in tg.deleted_topics and "уже отправлена" in tg.last(ANNA)["text"]
+
+
+async def test_a_task_removed_in_another_project_is_not_reported(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    before = len(tg.to(ANNA))
+    yg.tasks["t-1"]["columnId"] = "c-internal"
+    yg.tasks["t-1"]["deleted"] = True
+    await bot.refresh("t-1")
+    assert len(tg.to(ANNA)) == before and (await store.ticket("t-1")).deleted
+
+
+async def test_a_burst_of_events_is_one_refresh_and_one_rerun(bot, store, tg, yg, monkeypatch):
+    import asyncio
+
+    calls = []
+
+    async def slow(task_id, *, chat=True):
+        calls.append(chat)
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(bot, "refresh", slow)
+    await asyncio.gather(*(bot.coalesced("t-1", chat=i == 3) for i in range(5)))
+    assert calls == [False, True], "the first, then one rerun that also reads the chat"
+
+
+async def test_the_periodic_check_skips_what_a_webhook_just_did(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    await bot.refresh("t-1")
+    yg.requests.clear()
+    assert await bot.refresh_open(fresh_within=600) == 0
+    assert yg.requests == []
+    await bot.refresh_open()
+    assert yg.requests
+
+
+async def test_a_refused_person_cannot_ask_again_at_once(bot, store, tg):
+    await account(store)
+    await bot.handle(text(EVE, "/start"))
+    await bot.handle(text(EVE, "Ева"))
+    await bot.handle(tap(ADMIN, f"no:{EVE}"))
+    asks = sum("Запрос доступа" in m for m in tg.to(ADMIN))
+    await bot.handle(text(EVE, "/start"))
+    await bot.handle(text(EVE, "Ева снова"))
+    assert sum("Запрос доступа" in m for m in tg.to(ADMIN)) == asks
+    assert "отказано" in tg.to(EVE)[-1]
+
+
+async def test_old_closed_tickets_lose_their_message_links(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    await store.update_ticket("t-1", completed=True)
+    await store.db._exec("UPDATE tickets SET created_at = now() - interval '100 days'")
+    await store.prune_messages()
+    rows = await store.db._all("SELECT * FROM ticket_tg_messages")
+    assert rows == []
+
+
+def test_updates_are_ordered_per_person():
+    from yougile_cloud.tickets.service import _person
+
+    assert _person(text(ANNA, "x")) == ANNA
+    assert _person(tap(EVE, "send")) == EVE
+    assert _person({"update_id": 1}) == 0
