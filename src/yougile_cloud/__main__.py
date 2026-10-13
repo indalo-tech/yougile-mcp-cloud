@@ -9,7 +9,7 @@ import os
 import sys
 from datetime import UTC, datetime, timedelta
 
-from . import __version__
+from . import __version__, logredact
 from .access import access_of
 from .crypto import new_fernet_key, new_token
 from .db import Database
@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> None:
     # yougile_mcp.client already logs each YouGile call (method, path, status, time); httpx2
     # would repeat it with the full URL, query strings included.
     logging.getLogger("httpx2").setLevel(logging.WARNING)
+    logredact.install()
     parser = argparse.ArgumentParser(prog="yougile-cloud")
     parser.add_argument("--version", action="version", version=f"yougile-cloud {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)

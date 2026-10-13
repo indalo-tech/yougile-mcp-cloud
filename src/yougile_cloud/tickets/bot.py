@@ -1030,8 +1030,10 @@ class TicketBot:
                 if exc.status not in (403, 404):
                     raise
                 # Out of the bot account's sight (moved to a board it cannot read): that is
-                # not removal, YouGile deletes softly. Say nothing, change nothing.
+                # not removal, YouGile deletes softly. Say nothing — and skip what is said in
+                # its chat meanwhile, or it would reach the sender once the task is back.
                 log.info("ticket %s is not visible to the bot (%s)", ticket.number, exc.status)
+                await self.skip_messages(ticket, desk)
                 return
             if task.get("deleted"):
                 await self.store.update_ticket(task_id, deleted=True)
@@ -1041,11 +1043,26 @@ class TicketBot:
                 await self.rename_topic(ticket, topic_name(ticket.number, ticket.title, "✖ "))
                 return
             if column is None or column.project_id != ticket.project_id:
+                # In another project (the internal one, say): nothing is reported, and what is
+                # said in its chat there stays there — even after the task comes back.
                 log.info("ticket %s is outside the customer's project: not reported", ticket.number)
+                await self.skip_messages(ticket, desk)
                 return
             await self.report_status(ticket, task, column.id, column.title)
             if chat:
                 await self.report_messages(ticket, account, desk)
+
+    async def skip_messages(self, ticket: Ticket, desk: Desk) -> None:
+        """Move the ticket's chat watermark past every message there is: they are never
+        relayed. Message ids are YouGile's own clock, so they are read, not guessed; when the
+        chat cannot be read, our clock is the fallback."""
+        try:
+            messages = await desk.messages_since(ticket.task_id, ticket.last_message_id)
+            mark = max([ticket.last_message_id, *(int(m["id"]) for m in messages)])
+        except YouGileError:
+            mark = max(ticket.last_message_id, now_ms())
+        if mark != ticket.last_message_id:
+            await self.store.update_ticket(ticket.task_id, last_message_id=mark)
 
     async def report_status(self, ticket: Ticket, task: dict, column_id: str, title: str) -> None:
         done = is_done(task, title)

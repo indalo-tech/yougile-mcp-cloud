@@ -10,7 +10,7 @@ from mcp.server.auth.provider import construct_redirect_uri
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from . import pages
+from . import pages, redirects
 from .crypto import Secrets
 from .kv import KV
 from .oauth import CloudOAuthProvider
@@ -67,7 +67,15 @@ class SignInPages:
     def _same_origin(self, request: Request) -> bool:
         return same_origin(request, self.settings.public_url)
 
-    def _form(self, flow: str, *, error: str | None = None, login: str = "", status: int = 200):
+    def _form(
+        self,
+        flow: str,
+        auth_request: dict,
+        *,
+        error: str | None = None,
+        login: str = "",
+        status: int = 200,
+    ):
         return html(
             pages.login_page(
                 action="/signin",
@@ -76,8 +84,23 @@ class SignInPages:
                 lead=LEAD,
                 error=error,
                 login=login,
+                client=(
+                    auth_request.get("client_name") or "",
+                    redirects.destination(auth_request.get("redirect_uri") or ""),
+                ),
             ),
             status,
+        )
+
+    async def refused(self, _request: Request) -> Response:
+        return html(
+            pages.message_page(
+                "Приложение не подключено",
+                "Это приложение не из списка известных AI-клиентов: вход в YouGile для него "
+                "закрыт, чтобы ключ доступа не попал на чужой сайт. Если вы подключаете свой "
+                "клиент, напишите администратору сервера.",
+            ),
+            403,
         )
 
     async def _request(self, flow: str) -> dict | None:
@@ -88,14 +111,15 @@ class SignInPages:
 
     async def show(self, request: Request) -> Response:
         flow = request.query_params.get("flow", "")
-        if not await self._request(flow):
+        auth_request = await self._request(flow)
+        if not auth_request:
             return html(
                 pages.message_page(
                     "Ссылка устарела", "Начните подключение заново в вашем AI-клиенте."
                 ),
                 400,
             )
-        return self._form(flow)
+        return self._form(flow, auth_request)
 
     async def submit(self, request: Request) -> Response:
         form = await request.form()
@@ -112,21 +136,34 @@ class SignInPages:
         login = str(form.get("login", "")).strip()
         password = str(form.get("password", ""))
         if not login or not password:
-            return self._form(flow, error="Введите логин и пароль.", login=login, status=400)
+            return self._form(
+                flow, auth_request, error="Введите логин и пароль.", login=login, status=400
+            )
         try:
             await self.signin.count_attempt(request.client.host if request.client else "?", login)
             companies = await self.signin.companies(login, password)
         except TooManyAttempts:
             return self._form(
-                flow, error="Слишком много попыток. Подождите 15 минут.", login=login, status=429
+                flow,
+                auth_request,
+                error="Слишком много попыток. Подождите 15 минут.",
+                login=login,
+                status=429,
             )
         except BadCredentials:
             return self._form(
-                flow, error="Неверный логин или пароль YouGile.", login=login, status=401
+                flow,
+                auth_request,
+                error="Неверный логин или пароль YouGile.",
+                login=login,
+                status=401,
             )
         if not companies:
             return self._form(
-                flow, error="У этой учётной записи нет компаний в YouGile.", login=login
+                flow,
+                auth_request,
+                error="У этой учётной записи нет компаний в YouGile.",
+                login=login,
             )
         if len(companies) == 1:
             return await self._finish(flow, auth_request, login, password, companies[0])
@@ -181,7 +218,11 @@ class SignInPages:
             )
         except BadCredentials:
             return self._form(
-                flow, error="Неверный логин или пароль YouGile.", login=login, status=401
+                flow,
+                auth_request,
+                error="Неверный логин или пароль YouGile.",
+                login=login,
+                status=401,
             )
         finally:
             await self.kv.delete(self.kv.key("cred", flow))

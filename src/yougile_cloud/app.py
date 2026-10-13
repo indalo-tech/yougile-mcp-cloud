@@ -80,6 +80,7 @@ def create_server(settings: Settings, *, transport: Any = None) -> tuple[FastMCP
     mcp.custom_route("/signin", methods=["GET"])(services.pages.show)
     mcp.custom_route("/signin", methods=["POST"])(services.pages.submit)
     mcp.custom_route("/signin/company", methods=["POST"])(services.pages.choose_company)
+    mcp.custom_route("/signin/refused", methods=["GET"])(services.pages.refused)
     for path, method, endpoint in services.admin.routes():
         mcp.custom_route(path, methods=[method])(endpoint)
     mcp.custom_route("/healthz", methods=["GET"])(healthz)
