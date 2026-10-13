@@ -228,10 +228,9 @@ class TicketAdmin:
             company = ctx.session.company
             auth = self.pages.auth
             try:
-                await self.pages.signin.count_attempt(
-                    request.client.host if request.client else "?", login
-                )
-                companies = await auth.companies(login, password)
+                ip = request.client.host if request.client else "?"
+                await self.pages.signin.count_attempt(ip, login)
+                companies = await self.pages.signin.companies(login, password, ip)
                 if not any(c.id == company.id for c in companies):
                     return await self._page(
                         ctx, errors=[f"Эта учётка не состоит в компании «{company.name}»."]
@@ -245,6 +244,11 @@ class TicketAdmin:
             except KeyLimitReached:
                 return await self._page(
                     ctx, errors=["У учётки уже 30 ключей API: удалите лишние в YouGile."]
+                )
+            except YouGileError as exc:
+                log.warning("bot account: YouGile failed: %s", exc)
+                return await self._page(
+                    ctx, errors=["YouGile не ответил. Попробуйте через минуту."]
                 )
             if me.id == ctx.session.user.yougile_user_id:
                 await auth.delete_key(key)

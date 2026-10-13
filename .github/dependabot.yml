@@ -1,0 +1,8 @@
+# Actions are pinned to commits (a moved tag cannot change what CI runs with the deploy
+# secrets); Dependabot keeps the pins current. Python packages: uv.lock, updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

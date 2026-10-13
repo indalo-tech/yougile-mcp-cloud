@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -22,6 +24,9 @@ from .tenancy import Tenancy, TenantMiddleware
 from .web import SignInPages, healthz
 from .yougile_auth import YouGileAuth
 
+log = logging.getLogger(__name__)
+PURGE_EVERY = 24 * 3600  # seconds
+
 
 class Services:
     """Everything with connections; created on startup, closed on shutdown."""
@@ -36,6 +41,7 @@ class Services:
         self.db: Database | None = None
         self.kv: KV | None = None
         self.tenancy: Tenancy | None = None
+        self._purge: asyncio.Task | None = None
 
     async def start(self) -> None:
         self.db = Database(self.settings.database_url)
@@ -46,10 +52,23 @@ class Services:
         self.tenancy = Tenancy(self.settings, self.db, self.kv, self.secrets, self.transport)
         self.provider.attach(self.db, self.kv)
         signin = SignIn(self.settings, self.db, self.kv, self.secrets, auth)
+        signin.on_key_change = self.tenancy.forget  # a new key: no cached session keeps the old
         self.pages.attach(signin, self.kv)
         self.admin.attach(self.db, self.kv, signin, auth, self.tenancy, self.transport)
+        self._purge = asyncio.create_task(self._purge_daily())
+
+    async def _purge_daily(self) -> None:
+        while True:
+            try:
+                removed = await self.db.purge_expired()
+                log.info("purged %d expired rows", removed)
+            except Exception:
+                log.exception("purging expired rows failed")
+            await asyncio.sleep(PURGE_EVERY)
 
     async def stop(self) -> None:
+        if self._purge:
+            self._purge.cancel()
         if self.tenancy:
             await self.tenancy.close()
         if self.kv:

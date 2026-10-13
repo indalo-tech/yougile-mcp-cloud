@@ -369,8 +369,12 @@ class AdminPages:
         if not login or not password:
             return self._login_page(nonce, error="Введите логин и пароль.", login=login, status=400)
         try:
-            await self.signin.count_attempt(request.client.host if request.client else "?", login)
-            companies = await self.signin.companies(login, password)
+            ip = request.client.host if request.client else "?"
+            await self.signin.count_attempt(ip, login)
+            companies = await self.signin.companies(login, password, ip)
+        except YouGileError as exc:
+            log.warning("admin sign-in: YouGile failed: %s", exc)
+            return self._message("YouGile не ответил", "Попробуйте ещё раз через минуту.", 502)
         except TooManyAttempts:
             return self._login_page(
                 nonce, error="Слишком много попыток. Подождите 15 минут.", login=login, status=429
@@ -443,6 +447,9 @@ class AdminPages:
             return self._login_page(
                 nonce, error="Неверный логин или пароль YouGile.", login=login, status=401
             )
+        except YouGileError as exc:
+            log.warning("admin sign-in: YouGile failed: %s", exc)
+            return self._message("YouGile не ответил", "Попробуйте ещё раз через минуту.", 502)
         finally:
             await self.kv.delete(self.kv.key("admincred", token_hash(nonce)))
         if connected.user is None or not connected.access.allowed:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .access import Access, access_of
@@ -10,12 +11,14 @@ from .crypto import Secrets
 from .db import Company, Database, User
 from .kv import KV
 from .settings import Settings
-from .yougile_auth import YouGileAuth, YouGileCompany
+from .yougile_auth import BadCredentials, YouGileAuth, YouGileCompany
 
 log = logging.getLogger(__name__)
 
-IP_LIMIT, IP_WINDOW = 20, 600  # sign-in attempts per client IP per 10 minutes
-LOGIN_LIMIT, LOGIN_WINDOW = 8, 900  # per YouGile login per 15 minutes
+# Failed sign-ins only (a person signing in again and again is not an attack):
+IP_LIMIT, IP_WINDOW = 20, 600  # per client IP per 10 minutes
+LOGIN_LIMIT, LOGIN_WINDOW = 8, 900  # per YouGile login from one IP per 15 minutes
+LOGIN_TOTAL_LIMIT = 30  # per YouGile login from anywhere per 15 minutes
 
 
 class TooManyAttempts(Exception):  # noqa: N818
@@ -34,17 +37,36 @@ class SignIn:
         self, settings: Settings, db: Database, kv: KV, secrets: Secrets, auth: YouGileAuth
     ) -> None:
         self.settings, self.db, self.kv, self.secrets, self.auth = settings, db, kv, secrets, auth
+        self.on_key_change: Callable[[int], None] | None = None  # the app: tenancy.forget
+
+    def _keys(self, ip: str, login: str) -> list[tuple[str, int, int]]:
+        name = login.strip().lower()
+        return [
+            (self.kv.key("try", "ip", ip), IP_WINDOW, IP_LIMIT),
+            # keyed by login and IP: a stranger elsewhere cannot lock someone out by guessing
+            (self.kv.key("try", "login", name, ip), LOGIN_WINDOW, LOGIN_LIMIT),
+            (self.kv.key("try", "login", name), LOGIN_WINDOW, LOGIN_TOTAL_LIMIT),
+        ]
 
     async def count_attempt(self, ip: str, login: str) -> None:
-        by_ip = await self.kv.hit(self.kv.key("try", "ip", ip), IP_WINDOW)
-        by_login = await self.kv.hit(
-            self.kv.key("try", "login", login.strip().lower()), LOGIN_WINDOW
-        )
-        if by_ip > IP_LIMIT or by_login > LOGIN_LIMIT:
-            raise TooManyAttempts()
+        """Refuse a sign-in once too many have failed; counts nothing itself."""
+        for key, _window, limit in self._keys(ip, login):
+            if await self.kv.peek(key) >= limit:
+                raise TooManyAttempts()
 
-    async def companies(self, login: str, password: str) -> list[YouGileCompany]:
-        return await self.auth.companies(login, password)
+    async def failed_attempt(self, ip: str, login: str) -> None:
+        for key, window, _limit in self._keys(ip, login):
+            await self.kv.hit(key, window)
+
+    async def companies(
+        self, login: str, password: str, ip: str | None = None
+    ) -> list[YouGileCompany]:
+        try:
+            return await self.auth.companies(login, password)
+        except BadCredentials:
+            if ip is not None:
+                await self.failed_attempt(ip, login)
+            raise
 
     async def connect(self, login: str, password: str, company: YouGileCompany) -> Connected:
         """Create or refresh the user's own key for this service and store it encrypted."""
@@ -57,15 +79,22 @@ class SignIn:
             return Connected(user=None, company=record, access=access)
 
         key = await self.auth.create_key(login, password, company.id)
-        me = await self.auth.me(key)
-        user, previous = await self.db.upsert_user(
-            company_id=company.id,
-            yougile_user_id=me.id,
-            email=me.email,
-            name=me.name,
-            is_admin=me.is_admin,
-            api_key_enc=self.secrets.encrypt(key),
-        )
+        try:
+            me = await self.auth.me(key)
+            user, previous = await self.db.upsert_user(
+                company_id=company.id,
+                yougile_user_id=me.id,
+                email=me.email,
+                name=me.name,
+                is_admin=me.is_admin,
+                api_key_enc=self.secrets.encrypt(key),
+            )
+        except BaseException:
+            # Not stored: the key would be an orphan counting towards YouGile's 30 per account.
+            await self.auth.delete_key(key)
+            raise
+        if self.on_key_change:
+            self.on_key_change(user.id)  # a cached session must not keep the revoked key
         if previous:
             # One key per person for this service: drop the old one so keys don't pile up
             # towards YouGile's limit of 30 per account.
