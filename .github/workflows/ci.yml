@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     services:
       postgres:
         image: postgres:18-alpine
@@ -44,7 +44,7 @@ jobs:
   image:
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -73,7 +73,7 @@ jobs:
 
   deploy:
     needs: image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment:
       name: production
       url: https://yougile.indalo.ru
