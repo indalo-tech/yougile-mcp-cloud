@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from mcp.server.auth.provider import construct_redirect_uri
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from yougile_mcp.client import YouGileError
 
 from . import pages, redirects
 from .crypto import Secrets
@@ -140,8 +141,14 @@ class SignInPages:
                 flow, auth_request, error="Введите логин и пароль.", login=login, status=400
             )
         try:
-            await self.signin.count_attempt(request.client.host if request.client else "?", login)
-            companies = await self.signin.companies(login, password)
+            ip = request.client.host if request.client else "?"
+            await self.signin.count_attempt(ip, login)
+            companies = await self.signin.companies(login, password, ip)
+        except YouGileError as exc:
+            log.warning("sign-in: YouGile failed: %s", exc)
+            return html(
+                pages.message_page("YouGile не ответил", "Попробуйте ещё раз через минуту."), 502
+            )
         except TooManyAttempts:
             return self._form(
                 flow,
@@ -223,6 +230,11 @@ class SignInPages:
                 error="Неверный логин или пароль YouGile.",
                 login=login,
                 status=401,
+            )
+        except YouGileError as exc:
+            log.warning("sign-in: YouGile failed: %s", exc)
+            return html(
+                pages.message_page("YouGile не ответил", "Попробуйте ещё раз через минуту."), 502
             )
         finally:
             await self.kv.delete(self.kv.key("cred", flow))

@@ -57,6 +57,15 @@ return 1
 )
 
 
+_HIT = Script(
+    """
+local count = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1])) end
+return count
+"""
+)
+
+
 def config_from_url(url: str) -> GlideClientConfiguration:
     """``valkey://[user:password@]host:port[/db]`` (``valkeys://`` for TLS)."""
     parsed = urlparse(url)
@@ -118,11 +127,14 @@ class KV:
             await self.client.delete(list(keys))
 
     async def hit(self, key: str, window: int) -> int:
-        """Count an event in a fixed window; returns the count including this one."""
-        count = await self.client.incr(key)
-        if count == 1:
-            await self.client.expire(key, window)
-        return count
+        """Count an event in a fixed window; returns the count including this one. One script:
+        a counter can never be left without its expiry (it would lock a login for good)."""
+        result = await self.client.invoke_script(_HIT, keys=[key], args=[str(window)])
+        return int(result)
+
+    async def peek(self, key: str) -> int:
+        raw = await self.client.get(key)
+        return int(raw) if raw else 0
 
     async def acquire_slot(self, bucket: str, limit: int, window: float = 60.0) -> float:
         result = await self.client.invoke_script(

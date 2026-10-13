@@ -125,13 +125,13 @@ class Tenancy:
                 entry.checked_at = now
             else:
                 if entry:
-                    asyncio.create_task(entry.runtime.client.aclose())  # noqa: RUF006
+                    _close_later(entry.runtime.client)
                 entry = _Entry(self._build(user, company, rights), version, now)
                 self._cache[user_id] = entry
             self._cache.move_to_end(user_id)
             while len(self._cache) > self.MAX_ENTRIES:
                 _, old = self._cache.popitem(last=False)
-                asyncio.create_task(old.runtime.client.aclose())  # noqa: RUF006
+                _close_later(old.runtime.client)
         return entry.runtime
 
     async def caller_runtime(self) -> runtime.Runtime:
@@ -144,12 +144,22 @@ class Tenancy:
     def forget(self, user_id: int) -> None:
         entry = self._cache.pop(user_id, None)
         if entry:
-            asyncio.create_task(entry.runtime.client.aclose())  # noqa: RUF006
+            _close_later(entry.runtime.client)
 
     async def close(self) -> None:
         for entry in self._cache.values():
             await entry.runtime.client.aclose()
         self._cache.clear()
+
+
+CLOSE_DELAY = 60.0  # a replaced client may still be serving a tool call: closed after this
+
+
+def _close_later(client: YouGileClient) -> None:
+    asyncio.get_running_loop().call_later(
+        CLOSE_DELAY,
+        lambda: asyncio.ensure_future(client.aclose()),
+    )
 
 
 class TenantMiddleware(Middleware):

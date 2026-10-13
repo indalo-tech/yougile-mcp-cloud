@@ -112,12 +112,14 @@ class Database:
         files = sorted(f for f in resources.files(MIGRATIONS).iterdir() if f.name.endswith(".sql"))
         applied: list[str] = []
         async with self.pool.connection() as conn:
-            await conn.execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations "
-                "(name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
-            )
+            # The lock first: the app and the bot start together, and two CREATE TABLE IF NOT
+            # EXISTS at once can still collide on an empty database.
             await conn.execute("SELECT pg_advisory_lock(7271726)")  # one migrator at a time
             try:
+                await conn.execute(
+                    "CREATE TABLE IF NOT EXISTS schema_migrations "
+                    "(name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+                )
                 cur = await conn.execute("SELECT name FROM schema_migrations")
                 done = {row["name"] for row in await cur.fetchall()}
                 for file in files:
@@ -201,6 +203,11 @@ class Database:
     ) -> tuple[User, bytes | None]:
         """Store the user with a fresh key; returns the user and the previous key (to revoke)."""
         async with self.pool.connection() as conn, conn.transaction():
+            # Two first sign-ins of one person at once: FOR UPDATE locks no row that does not
+            # exist yet, so the second would overwrite the first key and leave it in YouGile.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{company_id}:{yougile_user_id}",)
+            )
             cur = await conn.execute(
                 "SELECT api_key_enc FROM users WHERE company_id = %s AND yougile_user_id = %s "
                 "FOR UPDATE",
@@ -336,7 +343,15 @@ class Database:
         return await self._exec("DELETE FROM refresh_tokens WHERE user_id = %s", (user_id,))
 
     async def purge_expired(self) -> int:
-        return await self._exec("DELETE FROM refresh_tokens WHERE expires_at < now()")
+        """Expired refresh tokens, clients registered and never used for a month, a year-old
+        audit log: none of it would ever be deleted otherwise."""
+        removed = await self._exec("DELETE FROM refresh_tokens WHERE expires_at < now()")
+        removed += await self._exec(
+            "DELETE FROM oauth_clients c WHERE c.created_at < now() - interval '30 days' "
+            "AND NOT EXISTS (SELECT 1 FROM refresh_tokens r WHERE r.client_id = c.client_id)"
+        )
+        removed += await self._exec("DELETE FROM audit_log WHERE at < now() - interval '1 year'")
+        return removed
 
     # ---------- audit ----------
 
