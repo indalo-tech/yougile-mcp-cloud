@@ -1427,16 +1427,16 @@ wheels = [
 
 [[package]]
 name = "yougile-mcp"
-version = "0.20.0"
+version = "0.21.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastmcp" },
     { name = "httpx2" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/38/b2/b80316124afbca42102dc53df9c369bd3df3580bf17b3c9d311bf87b0b0e/yougile_mcp-0.20.0.tar.gz", hash = "sha256:290b5a84e2b4cbd0c07af366926e55d6fbeb80a353b5d95369aaa5a1b7beb50e", size = 256738, upload-time = "2026-10-13T17:36:51.915Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/31/6dc710199acb9d4a87e7e83ffa7a3e07001378997ad06e4ed06869ed93c4/yougile_mcp-0.21.0.tar.gz", hash = "sha256:2ad7dc4234425f4bca972e536404713a9fce2b5a90d92200e877948330d12718", size = 265695, upload-time = "2026-10-13T20:16:35.966Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/f7/cf024a279789023a9400dada807d5bcd3ee02003364e8b5fe15eb1afe253/yougile_mcp-0.20.0-py3-none-any.whl", hash = "sha256:c05093eb641a01b2a90d6417f82b6d86ab38657656b68cef566afdd5f7b57bae", size = 136724, upload-time = "2026-10-13T17:36:50.411Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/f6/975fde331a1c13a1053982702c520196215d3c17fa935cd15e1d6e6dcad6/yougile_mcp-0.21.0-py3-none-any.whl", hash = "sha256:515fc3317ed8592614abaa5b24e61244c4ab0665e5307f48ad84933bb0317948", size = 140731, upload-time = "2026-10-13T20:16:34.481Z" },
 ]
 
 [package.optional-dependencies]
@@ -1472,7 +1472,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "uvicorn", specifier = ">=0.53" },
     { name = "valkey-glide", specifier = ">=2.5.2" },
-    { name = "yougile-mcp", extras = ["apps"], specifier = ">=0.20.0" },
+    { name = "yougile-mcp", extras = ["apps"], specifier = ">=0.21.0" },
 ]
 
 [package.metadata.requires-dev]
