@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import mimetypes
 import time
@@ -19,6 +20,7 @@ from ..kv import KV, CompanyRateLimiter
 from .store import Account
 
 CACHE_TTL = 600.0
+COLUMNS_TTL = 86_400.0  # a column's title and project rarely change: a day saves 2 requests
 REQUESTS_BOARD = "заявки"  # a project takes tickets once it has a board with this name
 SKIP_COLUMNS = {"документы"}  # never the column a new ticket lands in
 
@@ -118,7 +120,7 @@ class Desk:
 
     async def column(self, column_id: str) -> Column:
         cached = self._columns.get(column_id)
-        if cached and time.monotonic() - cached[0] < CACHE_TTL:
+        if cached and time.monotonic() - cached[0] < COLUMNS_TTL:
             return cached[1]
         column = await self.client.request("GET", f"/columns/{column_id}")
         board = await self.client.request("GET", f"/boards/{column['boardId']}")
@@ -193,6 +195,10 @@ class Desks:
 
     def get(self, account: Account) -> Desk:
         desk = self._desks.get(account.id)
+        if desk is not None and desk.account != account:
+            # A new key: the old client may still serve a request in flight; close it later.
+            old = desk.client
+            asyncio.get_running_loop().call_later(60, lambda: asyncio.ensure_future(old.aclose()))
         if desk is None or desk.account != account:
             limiter = (
                 CompanyRateLimiter(self.kv, account.company_id, self.rate_limit)

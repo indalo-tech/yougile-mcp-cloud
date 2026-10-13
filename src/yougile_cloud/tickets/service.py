@@ -31,6 +31,8 @@ from .telegram import Telegram, TelegramError
 log = logging.getLogger(__name__)
 
 HOOK_PREFIX = "/tickets/hook/"
+RECONCILE_PAUSE = 2.0  # seconds between tickets in the periodic check
+CONCURRENT_UPDATES = 8  # Telegram updates handled at once (one person's stay in order)
 WEBHOOK_EVENTS = ("task-.*", "chat_message-created")
 
 
@@ -51,6 +53,14 @@ class TicketSettings:
         except ValueError as exc:
             raise SettingsError(f"TICKETS_ADMINS / TICKETS_RECONCILE_SECONDS: {exc}") from exc
         return cls((env.get("TICKETS_BOT_TOKEN") or "").strip() or None, admins, reconcile)
+
+
+def _person(update: dict) -> int:
+    """Whose update it is: they are handled in order, everyone else alongside."""
+    for kind in ("message", "callback_query"):
+        if who := (update.get(kind) or {}).get("from"):
+            return int(who.get("id") or 0)
+    return 0
 
 
 def hook_secret(jwt_secret: str) -> str:
@@ -191,6 +201,22 @@ class TicketService:
     @staticmethod
     async def _poll(tg: Telegram, bot: TicketBot) -> None:
         offset: int | None = None
+        people: dict[int, list] = {}  # person -> [their lock, updates of theirs not done]
+        running: set[asyncio.Task] = set()
+        slots = asyncio.Semaphore(CONCURRENT_UPDATES)
+
+        async def _one(update: dict, person: int) -> None:
+            entry = people[person]
+            try:
+                async with entry[0], slots:
+                    await bot.handle(update)
+            except Exception:
+                log.exception("update %s failed", update.get("update_id"))
+            finally:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    people.pop(person, None)
+
         with contextlib.suppress(TelegramError):
             await tg.call("deleteWebhook")  # long polling and a webhook exclude each other
         await bot.setup()
@@ -203,10 +229,13 @@ class TicketService:
                 continue
             for update in updates:
                 offset = update["update_id"] + 1
-                try:
-                    await bot.handle(update)
-                except Exception:
-                    log.exception("update %s failed", update.get("update_id"))
+                # Handled side by side (a ticket with files must not hold everyone up), but in
+                # order for each person: their lock is taken in arrival order.
+                person = _person(update)
+                people.setdefault(person, [asyncio.Lock(), 0])[1] += 1
+                task = asyncio.create_task(_one(update, person))
+                running.add(task)
+                task.add_done_callback(running.discard)
 
     async def _reconcile(self) -> None:
         """Webhooks can be lost: look at every open ticket now and then."""
@@ -216,7 +245,10 @@ class TicketService:
                 continue
             try:
                 await self.bot.store.drop_stale_drafts()
-                await self.bot.refresh_open()
+                await self.bot.store.prune_messages()
+                await self.bot.refresh_open(
+                    fresh_within=self.tickets.reconcile_seconds, pause=RECONCILE_PAUSE
+                )
             except Exception:
                 log.exception("checking open tickets failed")
 
