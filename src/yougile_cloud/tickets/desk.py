@@ -96,11 +96,20 @@ class Desk:
         self._projects = (time.monotonic(), found)
         return found
 
-    async def create_task(self, column_id: str, title: str, description_html: str) -> dict:
+    async def create_task(
+        self, column_id: str, title: str, description_html: str, idempotency_key: str
+    ) -> dict:
+        """Create the task; the same key returns the same task (YouGile's own guarantee), so a
+        timeout, a second tap or a restart cannot make it twice."""
         created = await self.client.request(
             "POST",
             "/tasks",
-            json={"title": title, "columnId": column_id, "description": description_html},
+            json={
+                "title": title,
+                "columnId": column_id,
+                "description": description_html,
+                "idempotencyKey": idempotency_key,
+            },
         )
         return await self.client.request("GET", f"/tasks/{created['id']}")
 

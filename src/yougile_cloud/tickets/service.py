@@ -69,6 +69,7 @@ class TicketService:
     or from the environment when the page has none; re-reads them every WATCH_SECONDS."""
 
     WATCH_SECONDS = 20
+    RETRY_SECONDS = 60
 
     def __init__(
         self,
@@ -111,6 +112,7 @@ class TicketService:
         if poll:
             self._spawn(self._watch())
             self._spawn(self._reconcile())
+            self._spawn(self._retry())
 
     async def config(self) -> tuple[str | None, frozenset[int]]:
         """The token and the approvers: the admin page's, else the environment's."""
@@ -217,6 +219,17 @@ class TicketService:
                 await self.bot.refresh_open()
             except Exception:
                 log.exception("checking open tickets failed")
+
+    async def _retry(self) -> None:
+        """Reports that failed (Telegram unreachable) go out within a minute of its return."""
+        while True:
+            await asyncio.sleep(self.RETRY_SECONDS)
+            if self.bot is None or not self.bot.pending:
+                continue
+            try:
+                await self.bot.retry_pending()
+            except Exception:
+                log.exception("retrying failed reports failed")
 
     async def _handle_event(self, event: dict) -> None:
         bot = self.bot

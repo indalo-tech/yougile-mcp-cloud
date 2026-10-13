@@ -15,6 +15,7 @@ from starlette.requests import Request
 from yougile_cloud.crypto import Secrets
 from yougile_cloud.db import Database
 from yougile_cloud.settings import Settings
+from yougile_cloud.tickets import telegram as telegram_module
 from yougile_cloud.tickets.bot import MENU, MINE, NEW, TicketBot, attachment, ids_in
 from yougile_cloud.tickets.desk import Desks, text_html
 from yougile_cloud.tickets.service import TicketService, TicketSettings, hook_secret
@@ -40,12 +41,16 @@ class FakeTelegram:
         self.deleted_topics: list[int] = []
         self.edits: list[dict] = []  # editMessageText
         self.reactions: list[dict] = []
+        self.down = False  # Telegram unreachable: every call fails to connect
+        self.fail_getme = False
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
         if "/file/bot" in path:
             return httpx2.Response(200, content=b"PHOTO-BYTES")
         method = path.rsplit("/", 1)[-1]
+        if self.down or (self.fail_getme and method == "getMe"):
+            raise httpx2.ConnectError("unreachable", request=request)
         self.calls.append(method)
         body = json.loads(request.content) if request.content else {}
         result: Any = True
@@ -120,6 +125,8 @@ class FakeYouGile:
         self.uploads: list[str] = []
         self.hidden: set[str] = set()  # tasks the bot account cannot see (403)
         self.broken: set[str] = set()  # tasks whose reading fails (400)
+        self.fail_get_once = False  # the next task read fails (as after a timed-out create)
+        self.by_key: dict[str, str] = {}  # idempotencyKey -> task id
         self.requests: list[str] = []
         self.clock = 2_000_000_000_000
 
@@ -134,15 +141,23 @@ class FakeYouGile:
         self.requests.append(f"{request.method} {path}")
         body = json.loads(request.content) if request.content and path != "/upload-file" else {}
         if request.method == "POST" and path == "/tasks":
+            key = body.pop("idempotencyKey", None)
+            if key in self.by_key:  # YouGile: the same key returns the task already made
+                return httpx2.Response(201, json={"id": self.by_key[key]})
             n = len(self.tasks) + 1
             task = {"id": f"t-{n}", "idTaskCommon": f"ID-{n}", "completed": False, **body}
             self.tasks[task["id"]] = task
+            if key:
+                self.by_key[key] = task["id"]
             return httpx2.Response(201, json={"id": task["id"]})
         if m := re.fullmatch(r"/tasks/([\w-]+)", path):
             if m[1] in self.hidden:
                 return httpx2.Response(403, json={"message": "forbidden"})
             if m[1] in self.broken:
                 return httpx2.Response(400, json={"message": "broken"})
+            if self.fail_get_once:
+                self.fail_get_once = False
+                return httpx2.Response(400, json={"message": "timed out"})
             task = self.tasks.get(m[1])
             return httpx2.Response(200, json=task) if task else httpx2.Response(404, json={})
         if path in ("/projects", "/boards", "/columns"):
@@ -808,3 +823,98 @@ async def test_a_topic_message_without_the_topic_flag_still_counts(bot, store, t
     del reply["message"]["is_topic_message"]
     await bot.handle(reply)
     assert yg.chats["t-1"][-1]["text"].endswith("Ответ без флага")
+
+
+# ---------------- a flaky Telegram, blocked senders, repeats ----------------
+
+
+@pytest.fixture
+def no_connect_retries(monkeypatch):
+    monkeypatch.setattr(telegram_module, "CONNECT_ATTEMPTS", 1)
+
+
+async def test_telegram_down_then_back_nothing_lost_nothing_twice(
+    bot, store, tg, yg, no_connect_retries
+):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    before = len(tg.to(ANNA))
+    seen = (await store.ticket("t-1")).last_message_id
+    tg.down = True
+    yg.tasks["t-1"]["columnId"] = "c-work"
+    yg.message("t-1", "u-dev", "Какой браузер?")
+    await bot.on_event({"event": "task-moved", "payload": {"id": "t-1"}})
+    await bot.on_event({"event": "chat_message-created", "payload": {"chatId": "t-1"}})
+    t = await store.ticket("t-1")
+    assert t.column_id == "c-queue" and t.last_message_id == seen, "nothing marked as told"
+    assert bot.pending == {"t-1"}
+    assert await bot.retry_pending() == 1  # still down
+    tg.down = False
+    assert await bot.retry_pending() == 0
+    told = tg.to(ANNA)[before:]
+    assert len(told) == 2 and told[0].endswith("В работе.") and "Какой браузер?" in told[1]
+    await bot.refresh("t-1")
+    await bot.retry_pending()
+    assert len(tg.to(ANNA)) == before + 2, "nothing twice"
+
+
+async def test_a_blocked_sender_hears_nothing_and_no_stale_news_later(bot, store, tg, yg):
+    a = await approved(bot, store, tg)
+    await ticket(bot, tg)
+    before = len(tg.to(ANNA))
+    await store.decide(ANNA, "blocked", by=ADMIN)
+    yg.tasks["t-1"]["columnId"] = "c-work"
+    yg.message("t-1", "u-dev", "Вопрос, пока заблокирован")
+    await bot.refresh("t-1")
+    assert len(tg.to(ANNA)) == before
+    assert (await store.ticket("t-1")).column_id == "c-work"  # kept in step silently
+    await store.decide(
+        ANNA, "approved", by=ADMIN, account_id=a, project_id="p-client", project_name="Работы"
+    )
+    await bot.refresh("t-1")
+    assert len(tg.to(ANNA)) == before
+
+
+async def test_a_retried_send_makes_one_ticket(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    await bot.handle(in_topic(ANNA, 700, "Не входит в админку"))
+    yg.fail_get_once = True  # the task is made, its read fails: the sender is told to retry
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    assert "Попробуйте «Отправить» ещё раз" in tg.last(ANNA)["text"]
+    assert len(yg.tasks) == 1 and await store.draft(ANNA, 700)
+    await bot.handle(tap_in(ANNA, "send:700", 700))
+    assert len(yg.tasks) == 1, "the same idempotency key: the same task"
+    assert (await store.ticket("t-1")).tg_thread_id == 700
+    assert tg.topics[700] == "ID-1 · Не входит в админку"
+
+
+async def test_the_same_message_twice_is_added_once(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    update = in_topic(ANNA, 700, "Один раз")
+    await bot.handle(update)
+    await bot.handle(update)  # redelivered after a restart, say
+    assert (await store.draft(ANNA, 700))["parts"] == ["Один раз"]
+
+
+async def test_a_pending_person_writing_again_re_asks_the_approvers(bot, store, tg):
+    await account(store)
+    await bot.handle(text(EVE, "/start"))
+    await bot.handle(text(EVE, "Ева, Подружки"))
+    asks = lambda: sum("Запрос доступа" in m for m in tg.to(ADMIN))  # noqa: E731
+    assert asks() == 1
+    await bot.handle(text(EVE, "ну что там?"))
+    assert asks() == 1, "not again at once"
+    await store.save_draft(EVE, {"step": "pending", "asked": 0})  # ten minutes later
+    await bot.handle(text(EVE, "ну что там?"))
+    assert asks() == 2
+    assert "рассматривается" in tg.to(EVE)[-1]
+
+
+async def test_a_getme_blip_keeps_topics_on(bot, tg, no_connect_retries):
+    tg.topics_on = True
+    assert await bot.topics_enabled()
+    tg.fail_getme = True
+    bot._topics = (bot._topics[0] - 10_000, True)  # time to check again
+    assert await bot.topics_enabled(), "a failed check keeps what was known"

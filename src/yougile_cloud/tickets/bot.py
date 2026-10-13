@@ -6,6 +6,7 @@ import asyncio
 import html
 import logging
 import time
+import uuid
 from collections import defaultdict
 from contextvars import ContextVar
 from typing import Any
@@ -42,6 +43,7 @@ MAX_FILES = 10
 MAX_TEXT = 3500  # Telegram allows 4096 characters per message
 MAX_TOPIC = 128  # characters in a topic's name
 TOPICS_RECHECK = 600.0  # seconds between checks that the bot's topics are on (@BotFather)
+REASK_AFTER = 600  # seconds: a pending person writing again re-sends the access request
 
 # The topic the message being handled came from: answers go back there.
 _thread: ContextVar[int | None] = ContextVar("ticket_bot_thread", default=None)
@@ -193,6 +195,12 @@ def is_service(msg: dict) -> bool:
     return bool((msg.get("from") or {}).get("is_bot")) or any(k in msg for k in SERVICE_KEYS)
 
 
+def new_draft() -> dict:
+    """A ticket being written. Its idempotency key is fixed now, before any send, so every
+    attempt to send it is the same request to YouGile."""
+    return {"step": "compose", "title": "", "parts": [], "files": [], "idem": uuid.uuid4().hex}
+
+
 def first_line(text: str) -> str:
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
@@ -259,6 +267,9 @@ class TicketBot:
         self.admins = admins
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._topics: tuple[float, bool] | None = None
+        # Tickets whose last report failed (Telegram unreachable): tried again every minute
+        # by the service, until it goes through. A restart leaves it to the regular check.
+        self.pending: set[str] = set()
 
     # ================= Telegram side =================
 
@@ -320,8 +331,11 @@ class TicketBot:
                 me = await self.tg.call("getMe")
                 self._topics = (now, bool(me.get("has_topics_enabled")))
             except TelegramError as exc:
+                # A blip must not flip the bot back to the main-chat flow for ten minutes:
+                # keep what was known, ask again in a minute.
                 log.info("getMe: %s", exc)
-                self._topics = (now, False)
+                known = self._topics[1] if self._topics else False
+                self._topics = (now - TOPICS_RECHECK + 60, known)
         return self._topics[1]
 
     async def on_message(self, msg: dict) -> None:
@@ -429,12 +443,10 @@ class TicketBot:
             await self.reply(chat, "Файл больше 20 МБ: бот такие не принимает. Пришлите ссылку.")
             return
         async with self._locks[f"draft:{uid}:{thread}"]:
-            draft = await self.store.draft(uid, thread) or {
-                "step": "compose",
-                "title": "",
-                "parts": [],
-                "files": [],
-            }
+            draft = await self.store.draft(uid, thread) or new_draft()
+            seen = draft.setdefault("seen", [])
+            if msg.get("message_id") in seen:
+                return  # the same update again (after a restart, say)
             if content:
                 draft["title"] = draft["title"] or clip(first_line(content), MAX_TITLE)
                 draft["parts"].append(content)
@@ -443,6 +455,9 @@ class TicketBot:
                     await self.reply(chat, f"Не больше {MAX_FILES} файлов на заявку.")
                     return
                 draft["files"].append(file)
+            seen.append(msg.get("message_id"))
+            # Saved before anything is sent: a failed card must not lose what was written.
+            await self.store.save_draft(uid, draft, thread)
             # The card with the buttons follows the latest message, so it stays at hand.
             old = draft.get("card")
             card = await self.reply(chat, draft_card(draft), markup=topic_buttons(thread))
@@ -472,9 +487,10 @@ class TicketBot:
             made = await self.create(chat, sender, title, draft)
             if made is None:
                 return
-            task, number, failed = made
+            task, number, desk = made
             await self.store.update_ticket(task["id"], tg_thread_id=thread)
             await self.store.save_draft(uid, {}, thread)
+        failed = await self.upload(desk, task["id"], draft.get("files") or [])
         ticket = await self.store.ticket(task["id"])
         assert ticket is not None
         await self.rename_topic(ticket, topic_name(number, title))
@@ -495,12 +511,17 @@ class TicketBot:
             await self.store.link_message(chat, draft["card"], task["id"])
         except (TelegramError, KeyError) as exc:
             log.info("editMessageText: %s", exc)
-            await self.say(chat, task["id"], text, thread=thread)
+            try:
+                await self.say(chat, task["id"], text, thread=thread)
+            except TelegramError as again:  # the ticket is made: the reply is a courtesy
+                log.info("cannot confirm %s: %s", number, again)
 
     async def create(
         self, chat: int, sender: Sender, title: str, draft: dict
-    ) -> tuple[dict, str, list[str]] | None:
-        """The ticket's task, with its files; None (and the sender told) when it failed."""
+    ) -> tuple[dict, str, Desk] | None:
+        """The ticket's task and row; None (and the sender told) when it failed. The draft's
+        idempotency key makes a repeat — a second tap, a retry after a timeout — return the
+        same task. Files are the caller's next step, once the draft is cleared."""
         account = await self.store.account(sender.account_id or 0)
         desk = self.desks.get(account) if account else None
         project = await self.project_of(desk, sender) if desk else None
@@ -513,14 +534,15 @@ class TicketBot:
         )
         description = text_html(body) + f"<p><i>Заявка из Telegram: {esc(signature)}</i></p>"
         try:
-            task = await desk.create_task(project.column_id, title, description)
+            task = await desk.create_task(
+                project.column_id, title, description, draft.get("idem") or uuid.uuid4().hex
+            )
         except YouGileError as exc:
             log.warning("cannot create a ticket in %s: %s", project.title, exc)
             await self.reply(
                 chat, "Не получилось создать заявку. Попробуйте «Отправить» ещё раз чуть позже."
             )
             return None
-        failed = await self.upload(desk, task["id"], draft.get("files") or [])
         number = task.get("idTaskCommon") or task["id"]
         await self.store.add_ticket(
             task_id=task["id"],
@@ -532,7 +554,7 @@ class TicketBot:
             column_id=task.get("columnId") or project.column_id,
             last_message_id=now_ms(),
         )
-        return task, number, failed
+        return task, number, desk
 
     async def help_text(self) -> str:
         return THREAD_HELP if await self.topics_enabled() else HELP
@@ -583,6 +605,12 @@ class TicketBot:
         if sender and sender.status == "blocked":
             return
         if sender and sender.status == "pending":
+            # The request may never have reached an approver (Telegram down at the time) or
+            # been missed: a person writing again after a while sends it once more.
+            draft = await self.store.draft(uid)
+            if time.time() - float(draft.get("asked") or 0) > REASK_AFTER:
+                await self.store.save_draft(uid, {"step": "pending", "asked": time.time()})
+                await self.ask_approvers(sender, msg["from"])
             await self.reply(
                 chat, "Запрос на доступ ещё рассматривается. Напишу, как только решат."
             )
@@ -596,9 +624,9 @@ class TicketBot:
         sender = await self.store.request_access(
             uid, clip(text, 200), user.get("username") or "", thread=thread_of(msg)
         )
-        await self.store.save_draft(uid, {})
-        await self.reply(chat, "Спасибо! Запрос на доступ отправлен. Напишу, когда его одобрят.")
+        await self.store.save_draft(uid, {"step": "pending", "asked": time.time()})
         await self.ask_approvers(sender, user)
+        await self.reply(chat, "Спасибо! Запрос на доступ отправлен. Напишу, когда его одобрят.")
 
     async def choices(self) -> list[tuple[str, str]]:
         """Approval buttons: one per project with a «Заявки» board, in every account."""
@@ -694,6 +722,7 @@ class TicketBot:
             verdict = "❌ Отклонено"
         if sender is None:
             return "Запрос не найден"
+        await self.store.save_draft(target, {})  # the «request pending» note
         await self.mark(msg, verdict)
         if project:
             help_text = await self.help_text()
@@ -796,9 +825,7 @@ class TicketBot:
             await self.reply(chat, "Сначала напишите заголовок текстом — одной строкой.")
             return
         title = clip(" ".join(text.split()), MAX_TITLE)
-        await self.store.save_draft(
-            uid, {"step": "details", "title": title, "parts": [], "files": []}
-        )
+        await self.store.save_draft(uid, {**new_draft(), "step": "details", "title": title})
         await self.reply(chat, ASK_DETAILS, markup=DRAFT_BUTTONS)
 
     async def take_details(self, chat: int, uid: int, draft: dict, msg: dict, text: str) -> None:
@@ -837,13 +864,13 @@ class TicketBot:
             draft = await self.store.draft(uid)
             if draft.get("step") != "details":
                 return  # sent already (a second tap) or cancelled
-            await self.store.save_draft(uid, {})
             title = draft["title"]
             made = await self.create(chat, sender, title, draft)
             if made is None:
-                await self.store.save_draft(uid, draft)  # to try «Отправить» again
-                return
-            task, number, failed = made
+                return  # the draft stays, with its key: «Отправить» again is safe
+            task, number, desk = made
+            await self.store.save_draft(uid, {})
+            failed = await self.upload(desk, task["id"], draft.get("files") or [])
             note = f"\n\nНе удалось приложить: {esc(', '.join(failed))}." if failed else ""
             await self.say(
                 chat,
@@ -942,8 +969,11 @@ class TicketBot:
             except TelegramError as exc:
                 log.info("setMessageReaction: %s", exc)
         note = " Файл приложить не удалось." if failed else ""
-        sent = await self.reply(chat, f"Передал в заявку <b>{esc(ticket.number)}</b>.{note}")
-        await self.store.link_message(chat, sent["message_id"], task_id)
+        try:  # the message is in the ticket already: the acknowledgement is a courtesy
+            sent = await self.reply(chat, f"Передал в заявку <b>{esc(ticket.number)}</b>.{note}")
+            await self.store.link_message(chat, sent["message_id"], task_id)
+        except TelegramError as exc:
+            log.info("cannot acknowledge a message to %s: %s", ticket.number, exc)
 
     async def list_tickets(self, chat: int, uid: int) -> None:
         tickets = await self.store.tickets_of(uid)
@@ -998,7 +1028,18 @@ class TicketBot:
                 await self.refresh(task_id, chat=not name.startswith("task-"))
             except Exception:
                 log.exception("refreshing ticket %s failed", task_id)
+                self.pending.add(task_id)
         return len(known)
+
+    async def retry_pending(self) -> int:
+        """Report again the tickets whose report failed; returns how many still fail."""
+        for task_id in list(self.pending):
+            try:
+                await self.refresh(task_id)
+                self.pending.discard(task_id)
+            except Exception as exc:  # still down: next minute
+                log.info("ticket %s still not reported: %s", task_id, exc)
+        return len(self.pending)
 
     async def refresh_open(self) -> int:
         """Check every open ticket (webhooks can be lost); returns how many failed."""
@@ -1006,8 +1047,10 @@ class TicketBot:
         for ticket in await self.store.open_tickets():
             try:
                 await self.refresh(ticket.task_id)
+                self.pending.discard(ticket.task_id)
             except Exception:
                 log.exception("refreshing ticket %s failed", ticket.number)
+                self.pending.add(ticket.task_id)
                 failed += 1
         return failed
 
@@ -1035,17 +1078,30 @@ class TicketBot:
                 log.info("ticket %s is not visible to the bot (%s)", ticket.number, exc.status)
                 await self.skip_messages(ticket, desk)
                 return
+            sender = await self.store.sender(ticket.tg_user_id)
+            quiet = sender is None or not sender.approved  # blocked, rejected: told nothing
             if task.get("deleted"):
+                if not quiet:  # told first, saved after: a failure is retried, not lost
+                    await self.notify(
+                        ticket, f"Заявка <b>{esc(ticket.number)}</b> «{esc(ticket.title)}» снята."
+                    )
+                    await self.rename_topic(ticket, topic_name(ticket.number, ticket.title, "✖ "))
                 await self.store.update_ticket(task_id, deleted=True)
-                await self.notify(
-                    ticket, f"Заявка <b>{esc(ticket.number)}</b> «{esc(ticket.title)}» снята."
-                )
-                await self.rename_topic(ticket, topic_name(ticket.number, ticket.title, "✖ "))
                 return
             if column is None or column.project_id != ticket.project_id:
                 # In another project (the internal one, say): nothing is reported, and what is
                 # said in its chat there stays there — even after the task comes back.
                 log.info("ticket %s is outside the customer's project: not reported", ticket.number)
+                await self.skip_messages(ticket, desk)
+                return
+            if quiet:
+                # Kept in step silently, so that unblocking later brings no stale news.
+                await self.store.update_ticket(
+                    task_id,
+                    column_id=column.id,
+                    completed=is_done(task, column.title),
+                    title=task.get("title") or ticket.title,
+                )
                 await self.skip_messages(ticket, desk)
                 return
             await self.report_status(ticket, task, column.id, column.title)
@@ -1069,17 +1125,17 @@ class TicketBot:
         name = task.get("title") or ticket.title
         if column_id == ticket.column_id and done == ticket.completed and name == ticket.title:
             return
-        await self.store.update_ticket(
-            ticket.task_id, column_id=column_id, completed=done, title=name
-        )
+        if column_id != ticket.column_id or done != ticket.completed:
+            head = f"<b>{esc(ticket.number)}</b> «{esc(name)}»"
+            text = f"✅ Заявка {head} выполнена." if done else f"🔄 Заявка {head}: {esc(title)}."
+            # Told first, saved after: if Telegram fails, the change is reported next time.
+            await self.notify(ticket, text)
         if done != ticket.completed or name != ticket.title:
             # A closed ticket's topic stays as its history, marked; writing there still works.
             await self.rename_topic(ticket, topic_name(ticket.number, name, "✅ " if done else ""))
-        if column_id == ticket.column_id and done == ticket.completed:
-            return  # only the title changed
-        head = f"<b>{esc(ticket.number)}</b> «{esc(name)}»"
-        text = f"✅ Заявка {head} выполнена." if done else f"🔄 Заявка {head}: {esc(title)}."
-        await self.notify(ticket, text)
+        await self.store.update_ticket(
+            ticket.task_id, column_id=column_id, completed=done, title=name
+        )
 
     async def report_messages(self, ticket: Ticket, account: Account, desk: Desk) -> None:
         messages = await desk.messages_since(ticket.task_id, ticket.last_message_id)
@@ -1106,5 +1162,7 @@ class TicketBot:
     async def notify(self, ticket: Ticket, text: str) -> None:
         try:
             await self.say(ticket.tg_user_id, ticket.task_id, text, thread=ticket.tg_thread_id)
-        except TelegramError as exc:  # the sender blocked the bot, say
-            log.info("cannot notify about %s: %s", ticket.number, exc)
+        except TelegramError as exc:
+            if not exc.permanent:
+                raise  # Telegram unreachable: nothing is marked as told, it is tried again
+            log.info("cannot notify about %s: %s", ticket.number, exc)  # blocked the bot
