@@ -24,11 +24,19 @@ class Restriction:
 
 
 def _writes(tool: str) -> list[str]:
-    """Every non-read action of a tool, including ``<tool>.delete*`` via ``deleted: true``."""
+    """Every non-read action of a tool, including ``<tool>.delete*`` via ``deleted: true``.
+
+    The core also names every removal ``<tool>.delete`` (so ``*.delete`` covers them all);
+    that alias is left out unless it is the object's own deletion: the removals are already
+    here under their own names, and rules saved before 0.21.0 keep showing as set."""
     names: list[str] = []
     for op in catalog.by_tool()[tool].values():
         if op.access != "read":
-            names.extend(n for n in action_names(op, {"deleted": True}) if n not in names)
+            names.extend(
+                n
+                for n in action_names(op, {"deleted": True})
+                if n not in names and (n != f"{tool}.delete" or op.name == "update")
+            )
     return names
 
 
