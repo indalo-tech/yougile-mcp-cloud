@@ -81,13 +81,24 @@ def login_page(
     lead: str,
     error: str | None = None,
     login: str = "",
+    client: tuple[str, str] | None = None,  # (the client's own name, where it sends you back)
 ) -> str:
     fields = "".join(
         f'<input type="hidden" name="{e(k)}" value="{e(v)}">' for k, v in hidden.items()
     )
+    asking = ""
+    if client:
+        name, back = client
+        asking = (
+            '<div class="ok" role="note">Доступ к вашему YouGile запрашивает '
+            f"<b>{e(name or 'приложение без названия')}</b>. После входа вы вернётесь: "
+            f"<b>{e(back)}</b>.<br>Если вы сейчас сами не подключали ассистента — закройте "
+            "страницу и не вводите пароль.</div>"
+        )
     return page(
         heading,
         f"<h1>{e(heading)}</h1><p class=lead>{e(lead)}</p>"
+        + asking
         + (f'<div class="error" role="alert">{e(error)}</div>' if error else "")
         + f'<form method="post" action="{e(action)}">{fields}'
         '<label for="login">Логин YouGile (email)</label>'

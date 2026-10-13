@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 from yougile_mcp.client import DEFAULT_BASE_URL, normalize_base_url
 
+from .redirects import parse_allowed
+
 
 class SettingsError(ValueError):
     pass
@@ -41,6 +43,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8000
     tickets_company_id: str | None = None  # the company whose admins set up the ticket bot
+    oauth_redirect_origins: tuple[str, ...] = ()  # beyond claude.ai/claude.com and loopback
     extra: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -78,6 +81,7 @@ class Settings:
                 host=env.get("HOST", "127.0.0.1"),
                 port=int(env.get("PORT", 8000)),
                 tickets_company_id=(env.get("TICKETS_COMPANY_ID") or "").strip() or None,
+                oauth_redirect_origins=parse_allowed(env.get("OAUTH_REDIRECT_ORIGINS")),
             )
         except ValueError as exc:
             raise SettingsError(f"invalid number in settings: {exc}") from exc

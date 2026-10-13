@@ -26,10 +26,12 @@ from mcp.server.auth.provider import (
     AuthorizationParams,
     AuthorizeError,
     RefreshToken,
+    RegistrationError,
     TokenError,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
+from . import redirects
 from .access import access_of
 from .crypto import Secrets, new_token, token_hash
 from .db import Database
@@ -66,6 +68,18 @@ class CloudOAuthProvider(OAuthProvider):
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if client_info.client_id is None:
             raise ValueError("client_id is required for client registration")
+        unknown = [
+            str(u)
+            for u in client_info.redirect_uris or []
+            if not redirects.allowed(str(u), self.settings.oauth_redirect_origins)
+        ]
+        if unknown:
+            # Open registration must not let anyone send people's codes to their own site.
+            raise RegistrationError(
+                error="invalid_redirect_uri",
+                error_description="this server accepts only known AI clients' callbacks and "
+                "loopback addresses",
+            )
         await self.db.save_client(
             client_info.client_id, client_info.model_dump(mode="json", exclude_none=True)
         )
@@ -75,6 +89,10 @@ class CloudOAuthProvider(OAuthProvider):
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
     ) -> str:
+        if not redirects.allowed(str(params.redirect_uri), self.settings.oauth_redirect_origins):
+            # A client registered before the allowlist, or with a changed list: refuse on our
+            # own page — an AuthorizeError would redirect to that very URI.
+            return f"{self.settings.public_url}/signin/refused"
         if params.resource and params.resource.rstrip("/") != self.settings.mcp_url:
             raise AuthorizeError(
                 error="invalid_request", error_description="unknown resource for this server"

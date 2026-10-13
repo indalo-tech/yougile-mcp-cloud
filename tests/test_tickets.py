@@ -437,6 +437,25 @@ async def test_a_task_moved_out_of_the_clients_project_is_never_reported(bot, st
     assert len(tg.to(ANNA)) == before
 
 
+async def test_what_is_said_while_the_task_is_internal_never_reaches_the_sender(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+    yg.tasks["t-1"]["columnId"] = "c-internal"
+    await bot.refresh("t-1")
+    yg.message("t-1", "u-dev", "внутреннее: клиентка Иванова, +7 900 000-00-00")
+    await bot.refresh("t-1")
+    yg.tasks["t-1"]["columnId"] = "c-work"  # back in the customer's project
+    yg.hidden.add("t-1")  # and out of the bot's sight for a while
+    yg.message("t-1", "u-dev", "внутреннее, пока бот не видел задачу")
+    await bot.refresh("t-1")
+    yg.hidden.clear()
+    yg.message("t-1", "u-dev", "Вопрос клиенту")
+    await bot.refresh("t-1")
+    told = tg.to(ANNA)
+    assert all("внутреннее" not in t for t in told)
+    assert told[-1].endswith("Вопрос клиенту") and any(t.endswith("В работе.") for t in told)
+
+
 async def test_events_about_other_tasks_cost_no_requests(bot, store, tg, yg):
     await approved(bot, store, tg)
     await ticket(bot, tg)
