@@ -34,6 +34,10 @@ SECURITY_HEADERS = {
     "Cache-Control": "no-store",
 }
 LEAD = "Подключение YouGile к AI-ассистенту. Войдите своей учётной записью YouGile."
+BANNED = (
+    "Администратор вашей компании закрыл вам подключение к YouGile MCP. "
+    "Если это ошибка, обратитесь к нему."
+)
 
 
 def html(body: str, status: int = 200, headers: dict[str, str] = SECURITY_HEADERS) -> HTMLResponse:
@@ -238,6 +242,8 @@ class SignInPages:
             )
         finally:
             await self.kv.delete(self.kv.key("cred", flow))
+        if connected.banned:
+            return html(pages.message_page("Подключение запрещено", BANNED), 403)
         if not connected.access.allowed or connected.user is None:
             return html(pages.message_page("Доступ закрыт", connected.access.message()), 402)
         code = await self.provider.issue_code(

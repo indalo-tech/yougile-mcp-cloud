@@ -26,6 +26,8 @@ DONE = {
     "rights": "Права сотрудника сохранены.",
     "reset": "Личные права сброшены: действуют настройки компании.",
     "disconnect": "Сотрудник отключён от YouGile MCP.",
+    "blocked": "Подключение запрещено. Если сотрудник был подключён, он отключён.",
+    "unblocked": "Запрет снят: сотрудник может подключиться своим логином YouGile.",
     "tickets_telegram": "Сохранено. Бот подхватит изменения в течение 20 секунд.",
     "tickets_account": "Учётка бота подключена.",
     "tickets_hooks": "Подписки на события YouGile на месте.",
@@ -74,6 +76,7 @@ class SettingsForm:
     copy_from: str = ""  # client copies: the internal project's id ("" = off)
     copy_to: str = ""  # ... and the client project's id
     copy_rules: str = ""
+    board: str = ""  # the company's default board id ("" = none)
 
 
 @dataclass
@@ -203,14 +206,24 @@ def _deny_cell(rights: Rights | None, company_denied: set[str]) -> str:
     return f"{total} {plural(total, 'запрет', 'запрета', 'запретов')}" if total else "—"
 
 
+def _pills(person: Person) -> str:
+    return (
+        ('<span class="pill">админ YouGile</span>' if person.yougile_admin else "")
+        + ("" if person.in_yougile else '<span class="pill">нет в YouGile</span>')
+        + (
+            '<span class="pill">подключение запрещено</span>'
+            if person.rights and person.rights.blocked
+            else ""
+        )
+    )
+
+
 def users_page(
     frame: Frame, people: list[Person], projects: dict[str, str], done: str | None
 ) -> str:
     rows = []
     for p in people:
-        pills = ('<span class="pill">админ YouGile</span>' if p.yougile_admin else "") + (
-            "" if p.in_yougile else '<span class="pill">нет в YouGile</span>'
-        )
+        pills = _pills(p)
         rows.append(
             f'<tr><td><a href="{_href(p)}"><b>{e(p.name)}</b></a>'
             f'<div class="muted">{e(p.email)}</div>{pills}</td>'
@@ -255,6 +268,37 @@ def _project_select(name: str, projects: list[tuple[str, str]], chosen: str) -> 
     return f'<select id="{name}" name="{name}">{options}</select>'
 
 
+def _board_field(values: SettingsForm, boards: list[tuple[str, str]]) -> str:
+    known = dict(boards)
+    gone = values.board and values.board not in known
+    options = (
+        '<option value="">— не задана —</option>'
+        + (
+            f'<option value="{e(values.board)}" selected>доска удалена или скрыта</option>'
+            if gone
+            else ""
+        )
+        + "".join(
+            f'<option value="{e(bid)}"{" selected" if bid == values.board else ""}>'
+            f"{e(label)}</option>"
+            for bid, label in boards
+        )
+    )
+    warning = (
+        '<p class="error">Выбранной доски больше нет или ваш ключ её не видит: выберите другую, '
+        "иначе ассистент будет просить доску у каждого.</p>"
+        if gone
+        else ""
+    )
+    return (
+        '<label for="board">Доска по умолчанию</label>'
+        f'<select id="board" name="board">{options}</select>{warning}'
+        '<p class="hint">Куда ассистент ставит задачи и где ищет, если человек не назвал доску. '
+        "Сотрудник может выбрать свою («работаю с доской …») — его выбор важнее; он виден на "
+        "странице сотрудника.</p>"
+    )
+
+
 def _client_copy_fields(values: SettingsForm, projects: list[tuple[str, str]]) -> str:
     return (
         "<fieldset><legend>Клиентские копии задач</legend>"
@@ -278,6 +322,7 @@ def settings_page(
     values: SettingsForm,
     projects: list[tuple[str, str]],
     columns: list[str],
+    boards: list[tuple[str, str]],
     *,
     errors: list[str] | None = None,
     done: str | None = None,
@@ -292,7 +337,8 @@ def settings_page(
         '<label for="default_role">Роль по умолчанию</label>'
         f'<select id="default_role" name="default_role">{roles}</select>'
         '<p class="hint">Для всех, кому не заданы личные права на странице сотрудника.</p>'
-        '<label for="instructions">Правила компании для ассистента</label>'
+        + _board_field(values, boards)
+        + '<label for="instructions">Правила компании для ассистента</label>'
         f'<textarea class="prose" id="instructions" name="instructions" maxlength="4000">'
         f"{e(values.instructions)}</textarea>"
         '<p class="hint">Ассистент видит их у каждого сотрудника: как называть задачи, куда '
@@ -335,6 +381,7 @@ def user_page(
     values: RightsForm,
     projects: list[tuple[str, str]],
     *,
+    board: str = "",
     errors: list[str] | None = None,
     done: str | None = None,
 ) -> str:
@@ -349,9 +396,8 @@ def user_page(
         f"{' checked' if values.scope == key else ''}> {label}</label>"
         for key, label in (("all", "Все проекты"), ("some", "Только отмеченные"))
     )
-    pills = ('<span class="pill">админ YouGile</span>' if person.yougile_admin else "") + (
-        "" if person.in_yougile else '<span class="pill">нет в YouGile</span>'
-    )
+    pills = _pills(person)
+    blocked = bool(person.rights and person.rights.blocked)
     connection = (
         f"<p>Подключение к YouGile MCP: {_mcp_cell(person, frame.tz)}</p>"
         if person.user
@@ -364,8 +410,22 @@ def user_page(
         if person.user
         else ""
     )
+    if blocked:
+        ban = (
+            f'<form method="post" action="{action}/unblock">{_csrf(frame.csrf)}'
+            '<button class="inline secondary" type="submit">Разрешить подключение</button></form>'
+        )
+    elif person.yougile_admin:
+        ban = ""  # an admin could lift a ban themselves
+    else:
+        ban = (
+            f'<form method="post" action="{action}/block">{_csrf(frame.csrf)}'
+            '<button class="inline danger" type="submit">Запретить подключение</button></form>'
+        )
+    board_line = f"<p>Доска по умолчанию: {e(board)}</p>" if board else ""
     body = (
         f'<h2>{e(person.name)}</h2><p class="muted">{e(person.email)}</p>{pills}{connection}'
+        + board_line
         + _errors(errors or [])
         + f'<form method="post" action="{action}">{_csrf(frame.csrf)}'
         '<label for="role">Роль</label>'
@@ -378,12 +438,15 @@ def user_page(
         '<div class="actions">'
         f'<form method="post" action="{action}/reset">{_csrf(frame.csrf)}'
         '<button class="inline secondary" type="submit">Сбросить к настройкам компании</button>'
-        f"</form>{disconnect}</div>"
+        f"</form>{disconnect}{ban}</div>"
         + (
-            '<p class="hint">Отключение удаляет ключ сервера и выводит человека из всех '
-            "AI-клиентов. Своим логином YouGile человек может подключиться снова; чтобы закрыть "
-            "доступ совсем, уберите сотрудника из компании в YouGile.</p>"
-            if person.user
+            '<p class="hint">Подключение запрещено: войти в YouGile MCP своим логином человек '
+            "не сможет, пока запрет не снят. Права выше сохраняются на случай, если снимете.</p>"
+            if blocked
+            else '<p class="hint">Отключение удаляет ключ сервера и выводит человека из всех '
+            "AI-клиентов, но своим логином YouGile он может подключиться снова. «Запретить "
+            "подключение» ещё и не даст войти, пока запрет не снят.</p>"
+            if ban
             else ""
         )
     )

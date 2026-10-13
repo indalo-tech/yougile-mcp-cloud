@@ -27,9 +27,10 @@ class TooManyAttempts(Exception):  # noqa: N818
 
 @dataclass(frozen=True)
 class Connected:
-    user: User | None  # None when the company has no access: no key is issued then
+    user: User | None  # None when the company has no access or the person is banned: no key
     company: Company
     access: Access
+    banned: bool = False  # the company admin forbade this person to connect
 
 
 class SignIn:
@@ -81,18 +82,28 @@ class SignIn:
         key = await self.auth.create_key(login, password, company.id)
         try:
             me = await self.auth.me(key)
-            user, previous = await self.db.upsert_user(
-                company_id=company.id,
-                yougile_user_id=me.id,
-                email=me.email,
-                name=me.name,
-                is_admin=me.is_admin,
-                api_key_enc=self.secrets.encrypt(key),
-            )
+            # Who it is is known only now. A company admin is never kept out: they could lift
+            # the ban themselves, and the admin page signs in this way too.
+            rights = await self.db.get_rights(company.id, me.id)
+            banned = bool(rights and rights.blocked and not me.is_admin)
+            if not banned:
+                user, previous = await self.db.upsert_user(
+                    company_id=company.id,
+                    yougile_user_id=me.id,
+                    email=me.email,
+                    name=me.name,
+                    is_admin=me.is_admin,
+                    api_key_enc=self.secrets.encrypt(key),
+                )
         except BaseException:
             # Not stored: the key would be an orphan counting towards YouGile's 30 per account.
             await self.auth.delete_key(key)
             raise
+        if banned:
+            await self.auth.delete_key(key)
+            await self.db.audit("sign_in_banned", company_id=company.id, target=me.id)
+            log.info("banned user %s refused for company %s", me.id, company.id)
+            return Connected(user=None, company=record, access=access, banned=True)
         if self.on_key_change:
             self.on_key_change(user.id)  # a cached session must not keep the revoked key
         if previous:

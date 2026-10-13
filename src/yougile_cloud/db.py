@@ -45,6 +45,13 @@ class Rights:
     projects: list[str] | None = None
     deny: list[str] = field(default_factory=list)
     updated_at: datetime | None = None
+    blocked: bool = False  # the company admin forbade this person to connect
+
+
+def _rights(row: dict) -> Rights:
+    return Rights(
+        row["role"], row["projects"], row["deny"] or [], row["updated_at"], row["blocked"]
+    )
 
 
 def _company(row: dict) -> Company:
@@ -256,16 +263,11 @@ class Database:
             "SELECT * FROM user_rights WHERE company_id = %s AND yougile_user_id = %s",
             (company_id, yougile_user_id),
         )
-        if not row:
-            return None
-        return Rights(row["role"], row["projects"], row["deny"] or [], row["updated_at"])
+        return _rights(row) if row else None
 
     async def list_rights(self, company_id: str) -> dict[str, Rights]:
         rows = await self._all("SELECT * FROM user_rights WHERE company_id = %s", (company_id,))
-        return {
-            r["yougile_user_id"]: Rights(r["role"], r["projects"], r["deny"] or [], r["updated_at"])
-            for r in rows
-        }
+        return {r["yougile_user_id"]: _rights(r) for r in rows}
 
     async def set_rights(
         self,
@@ -294,10 +296,28 @@ class Database:
         )
 
     async def delete_rights(self, company_id: str, yougile_user_id: str) -> None:
-        """Back to the company defaults."""
+        """Back to the company defaults; a ban on connecting stays."""
+        key = (company_id, yougile_user_id)
+        async with self.pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                "DELETE FROM user_rights WHERE company_id = %s AND yougile_user_id = %s "
+                "AND NOT blocked",
+                key,
+            )
+            await conn.execute(
+                "UPDATE user_rights SET role = NULL, projects = NULL, deny = '[]'::jsonb, "
+                "updated_at = now() WHERE company_id = %s AND yougile_user_id = %s",
+                key,
+            )
+
+    async def set_blocked(self, company_id: str, yougile_user_id: str, blocked: bool) -> None:
         await self._exec(
-            "DELETE FROM user_rights WHERE company_id = %s AND yougile_user_id = %s",
-            (company_id, yougile_user_id),
+            """
+            INSERT INTO user_rights (company_id, yougile_user_id, blocked) VALUES (%s, %s, %s)
+            ON CONFLICT (company_id, yougile_user_id) DO UPDATE SET
+                blocked = EXCLUDED.blocked, updated_at = now()
+            """,
+            (company_id, yougile_user_id, blocked),
         )
 
     # ---------- OAuth clients and refresh tokens ----------

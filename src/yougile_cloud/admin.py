@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 from yougile_mcp.client import YouGileClient, YouGileError
 from yougile_mcp.config import DEFAULT_TIMEZONE, ConfigError, WorkspaceConfig
-from yougile_mcp.directory import Directory, fetch_all
+from yougile_mcp.directory import Directory, Structure, fetch_all
 
 from . import admin_pages as ui
 from . import pages
@@ -80,6 +80,30 @@ def _project_ids(refs: Iterable[str], projects: list[tuple[str, str]]) -> set[st
     by_title = {_norm(title): pid for pid, title in projects}
     ids = {pid for pid, _ in projects}
     return {ref if ref in ids else by_title.get(_norm(ref), ref) for ref in refs}
+
+
+def _boards(structure: Structure) -> list[tuple[str, str]]:
+    """Boards a default can point to: those with columns, as (id, "Project / Board")."""
+    boards = [
+        (bid, structure.board_label(b))
+        for bid, b in structure.boards.items()
+        if structure.columns_of_board(bid)
+    ]
+    return sorted(boards, key=lambda b: b[1].casefold())
+
+
+def _board_note(person: ui.Person, structure: Structure, company_board: str | None) -> str:
+    """Which board this person's tools fall back to, in words."""
+
+    def label(board_id: str) -> str:
+        board = structure.boards.get(board_id)
+        return structure.board_label(board) if board else "доска удалена или скрыта"
+
+    if person.user and person.user.default_board:
+        return f"{label(person.user.default_board)} — выбрал сам"
+    if company_board:
+        return f"{label(company_board)} — по умолчанию компании"
+    return ""
 
 
 def _column_titles(columns: Iterable[dict]) -> list[str]:
@@ -177,6 +201,8 @@ class AdminPages:
             ("/admin/users/{user_id}", "POST", self.save_user),
             ("/admin/users/{user_id}/reset", "POST", self.reset_user),
             ("/admin/users/{user_id}/disconnect", "POST", self.disconnect_user),
+            ("/admin/users/{user_id}/block", "POST", self.block_user),
+            ("/admin/users/{user_id}/unblock", "POST", self.unblock_user),
             *(self.tickets.routes() if self.settings.tickets_company_id else []),
         ]
 
@@ -452,6 +478,10 @@ class AdminPages:
             return self._message("YouGile не ответил", "Попробуйте ещё раз через минуту.", 502)
         finally:
             await self.kv.delete(self.kv.key("admincred", token_hash(nonce)))
+        if connected.banned:  # not a company admin (those are never banned): no admin page
+            return self._message(
+                "Нет прав администратора", "YouGile не подтвердил права администратора.", 403
+            )
         if connected.user is None or not connected.access.allowed:
             return self._message("Доступ закрыт", connected.access.message(), 402)
         if not connected.user.is_admin:
@@ -519,10 +549,12 @@ class AdminPages:
             deny=ctx.frame.company_denied,
             workflows=format_workflows(s.get("workflows", {})),
             done=_pick_titles(s.get("done_columns", []), columns),
+            board=s.get("board") or "",
             **_copy_values(s.get("client_copy"), projects),
         )
         done = request.query_params.get("done")
-        return self._html(ui.settings_page(ctx.frame, values, projects, columns, done=done))
+        boards = _boards(structure)
+        return self._html(ui.settings_page(ctx.frame, values, projects, columns, boards, done=done))
 
     async def save_settings(self, request: Request) -> Response:
         return await self._guarded(request, self._save_settings, post=True)
@@ -543,8 +575,12 @@ class AdminPages:
             copy_from=str(form.get("copy_from", "")),
             copy_to=str(form.get("copy_to", "")),
             copy_rules=str(form.get("copy_rules", "")).replace("\r\n", "\n").strip(),
+            board=str(form.get("board", "")),
         )
+        boards = _boards(structure)
         errors: list[str] = []
+        if values.board and values.board not in dict(boards):
+            errors.append("Выберите доску по умолчанию из списка.")
         if values.timezone not in ui.timezones():
             errors.append(f"Неизвестный часовой пояс «{values.timezone}». Пример: Europe/Moscow.")
         if values.default_role not in ui.ROLES:
@@ -565,7 +601,10 @@ class AdminPages:
             "workflows": workflows,
             "done_columns": [title for title in columns if title in values.done],
             "client_copy": client_copy,
+            "board": values.board,
         }
+        if not values.board:
+            del new["board"]  # no company default: tools ask for a board
         if not errors:
             try:  # the same check the MCP side runs: a bad value must never reach it
                 keys = (
@@ -575,15 +614,16 @@ class AdminPages:
                     "deny",
                     "done_columns",
                     "client_copy",
+                    "board",
                 )
                 WorkspaceConfig.from_dict(
-                    {k: new[k] for k in keys}
+                    {k: new[k] for k in keys if k in new}
                     | {"role": new["default_role"], "confirm_projects": new["confirm_projects"]}
                 )
             except ConfigError as exc:
                 errors.append(str(exc))
         if errors:
-            page = ui.settings_page(ctx.frame, values, projects, columns, errors=errors)
+            page = ui.settings_page(ctx.frame, values, projects, columns, boards, errors=errors)
             return self._html(page, 400)
         company = ctx.session.company
         await self.db.save_company_settings(company.id, new)
@@ -597,6 +637,7 @@ class AdminPages:
             workflows=list(workflows),
             done_columns=new["done_columns"],
             client_copy=client_copy,
+            board=values.board or None,
         )
         return _redirect("/admin/settings?done=settings")
 
@@ -609,7 +650,9 @@ class AdminPages:
         person = await self._person(ctx, request.path_params["user_id"])
         if person is None:
             return self._message("Не найдено", "Такого сотрудника нет в компании.", 404)
-        projects = _projects(await fetch_all(ctx.client, "/projects"))
+        structure = await Directory(ctx.client).structure()
+        projects = _projects(structure.projects.values())
+        board = _board_note(person, structure, ctx.session.company.settings.get("board"))
         rights = person.rights
         values = ui.RightsForm(
             role=(rights.role or "") if rights else "",
@@ -618,7 +661,7 @@ class AdminPages:
             deny=denied_keys(rights.deny) if rights else set(),
         )
         done = request.query_params.get("done")
-        return self._html(ui.user_page(ctx.frame, person, values, projects, done=done))
+        return self._html(ui.user_page(ctx.frame, person, values, projects, board=board, done=done))
 
     async def save_user(self, request: Request) -> Response:
         return await self._guarded(request, self._save_user, post=True)
@@ -627,7 +670,8 @@ class AdminPages:
         person = await self._person(ctx, request.path_params["user_id"])
         if person is None:
             return self._message("Не найдено", "Такого сотрудника нет в компании.", 404)
-        projects = _projects(await fetch_all(ctx.client, "/projects"))
+        structure = await Directory(ctx.client).structure()
+        projects = _projects(structure.projects.values())
         form = ctx.form
         values = ui.RightsForm(
             role=str(form.get("role", "")),
@@ -641,7 +685,8 @@ class AdminPages:
         if values.scope == "some" and not values.projects:
             errors.append("Отметьте хотя бы один проект или выберите «Все проекты».")
         if errors:
-            page = ui.user_page(ctx.frame, person, values, projects, errors=errors)
+            board = _board_note(person, structure, ctx.session.company.settings.get("board"))
+            page = ui.user_page(ctx.frame, person, values, projects, board=board, errors=errors)
             return self._html(page, 400)
         chosen = sorted(values.projects) if values.scope == "some" else None
         deny = deny_list(values.deny)
@@ -683,18 +728,9 @@ class AdminPages:
     async def _disconnect_user(self, request: Request, ctx: Ctx) -> Response:
         person_id = request.path_params["user_id"]
         company = ctx.session.company
-        users = [u for u in await self.db.list_users(company.id) if u.yougile_user_id == person_id]
-        if not users:
+        user = await self._drop_connection(company.id, person_id)
+        if user is None:
             return self._message("Не найдено", "Этот сотрудник не подключён.", 404)
-        user = users[0]
-        try:
-            key = self.secrets.decrypt(user.api_key_enc)
-        except ValueError:
-            key = None
-        await self.db.delete_user(user.id)  # refresh tokens go with it (ON DELETE CASCADE)
-        self.tenancy.forget(user.id)
-        if key:
-            await self.auth.delete_key(key)
         await self.db.audit(
             "admin_disconnect", company_id=company.id, user_id=ctx.session.user.id, target=person_id
         )
@@ -704,3 +740,60 @@ class AdminPages:
             self._drop_cookie(response, self.session_cookie)
             return response
         return _redirect("/admin?done=disconnect")
+
+    async def _drop_connection(self, company_id: str, person_id: str) -> User | None:
+        """Delete the person's server key and sessions; the user that was, or None."""
+        users = [u for u in await self.db.list_users(company_id) if u.yougile_user_id == person_id]
+        if not users:
+            return None
+        user = users[0]
+        try:
+            key = self.secrets.decrypt(user.api_key_enc)
+        except ValueError:
+            key = None
+        await self.db.delete_user(user.id)  # refresh tokens go with it (ON DELETE CASCADE)
+        self.tenancy.forget(user.id)
+        if key:
+            await self.auth.delete_key(key)
+        return user
+
+    # ---------- banning ----------
+
+    async def block_user(self, request: Request) -> Response:
+        return await self._guarded(request, self._block_user, post=True)
+
+    async def _block_user(self, request: Request, ctx: Ctx) -> Response:
+        person = await self._person(ctx, request.path_params["user_id"])
+        if person is None:
+            return self._message("Не найдено", "Такого сотрудника нет в компании.", 404)
+        if person.yougile_admin or person.id == ctx.session.user.yougile_user_id:
+            # They could lift it themselves, and it would lock them out of this page.
+            return self._message(
+                "Нельзя запретить",
+                "Администратору компании в YouGile подключение не закрыть: он может снять "
+                "запрет сам. Сначала снимите с него права администратора в YouGile.",
+                400,
+            )
+        company = ctx.session.company
+        await self.db.set_blocked(company.id, person.id, True)
+        dropped = await self._drop_connection(company.id, person.id)
+        await self.db.audit(
+            "admin_block",
+            company_id=company.id,
+            user_id=ctx.session.user.id,
+            target=person.id,
+            disconnected=dropped is not None,
+        )
+        return _redirect(f"/admin/users/{quote(person.id, safe='')}?done=blocked")
+
+    async def unblock_user(self, request: Request) -> Response:
+        return await self._guarded(request, self._unblock_user, post=True)
+
+    async def _unblock_user(self, request: Request, ctx: Ctx) -> Response:
+        person_id = request.path_params["user_id"]
+        company = ctx.session.company
+        await self.db.set_blocked(company.id, person_id, False)
+        await self.db.audit(
+            "admin_unblock", company_id=company.id, user_id=ctx.session.user.id, target=person_id
+        )
+        return _redirect(f"/admin/users/{quote(person_id, safe='')}?done=unblocked")
