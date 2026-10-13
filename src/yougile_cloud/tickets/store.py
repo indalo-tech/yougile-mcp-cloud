@@ -229,7 +229,9 @@ class TicketStore:
             """
             INSERT INTO tickets (task_id, account_id, project_id, tg_user_id, number, title,
                                  column_id, last_message_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (task_id) DO UPDATE SET task_id = EXCLUDED.task_id
+            RETURNING *
             """,
             (
                 task_id,

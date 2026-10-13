@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 
 API = "https://api.telegram.org"
 MAX_DOWNLOAD = 20 * 1024 * 1024  # getFile serves files up to 20 MB
+CONNECT_ATTEMPTS = 3
 
 
 class TelegramError(Exception):
@@ -23,6 +24,12 @@ class TelegramError(Exception):
         super().__init__(f"Telegram {code}: {description}")
         self.code = code
         self.description = description
+
+    @property
+    def permanent(self) -> bool:
+        """The person blocked the bot or the chat is gone: retrying will not help. Network
+        errors (code 0), flood limits and Telegram's own failures are worth another try."""
+        return self.code in (400, 403)
 
 
 class Telegram:
@@ -34,10 +41,20 @@ class Telegram:
         await self._http.aclose()
 
     async def _post(self, method: str, **kwargs: Any) -> httpx2.Response:
-        try:
-            return await self._http.post(f"{API}/bot{self._token}/{method}", **kwargs)
-        except httpx2.TransportError as exc:
-            raise TelegramError(0, f"network error in {method}: {type(exc).__name__}") from None
+        """POST, again on a failed connection: then nothing reached Telegram, so even a send
+        may repeat. A timeout or a dropped reply is not repeated — the message may be out."""
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            try:
+                return await self._http.post(f"{API}/bot{self._token}/{method}", **kwargs)
+            except (httpx2.ConnectError, httpx2.ConnectTimeout) as exc:
+                if attempt == CONNECT_ATTEMPTS:
+                    raise TelegramError(
+                        0, f"network error in {method}: {type(exc).__name__}"
+                    ) from None
+                await asyncio.sleep(attempt)
+            except httpx2.TransportError as exc:
+                raise TelegramError(0, f"network error in {method}: {type(exc).__name__}") from None
+        raise AssertionError("unreachable")
 
     async def call(self, method: str, **params: Any) -> Any:
         """Call a Bot API method; waits out a flood limit once."""
