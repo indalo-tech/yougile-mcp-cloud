@@ -16,7 +16,7 @@ from yougile_cloud.crypto import Secrets
 from yougile_cloud.db import Database
 from yougile_cloud.settings import Settings
 from yougile_cloud.tickets import telegram as telegram_module
-from yougile_cloud.tickets.bot import MENU, MINE, NEW, TicketBot, attachment, ids_in
+from yougile_cloud.tickets.bot import MENU, MINE, NEW, TicketBot, attachment, ids_in, new_draft
 from yougile_cloud.tickets.desk import Desks, text_html
 from yougile_cloud.tickets.service import TicketService, TicketSettings, hook_secret
 from yougile_cloud.tickets.store import TicketStore
@@ -592,28 +592,19 @@ async def test_in_topic_mode_a_new_topic_is_a_new_ticket(bot, store, tg, yg):
     await approved(bot, store, tg)
     start = len(tg.sent)
 
+    # The first message of a new topic is the ticket: no draft, no button.
     await bot.handle(in_topic(ANNA, 700, "Не приходят уведомления\nС утра, на Невском"))
-    card = tg.last(ANNA)
-    assert card["message_thread_id"] == 700 and "«Не приходят уведомления»" in card["text"]
-    assert buttons(card) == ["send:700", "cancel:700"]
-    first_card = tg.next_id
-    await bot.handle(photo_in_topic(ANNA, 700))
-    assert first_card in tg.deleted, "the card follows the latest message"
-    assert "файлов: 1" in tg.last(ANNA)["text"] and yg.tasks == {}
-
-    card = tg.next_id
-    await bot.handle(tap_in(ANNA, "send:700", 700))
     task = yg.tasks["t-1"]
     assert task["title"] == "Не приходят уведомления" and "на Невском" in task["description"]
-    assert len(yg.uploads) == 1
     assert (await store.ticket("t-1")).tg_thread_id == 700
     assert tg.topics[700] == "ID-1 · Не приходят уведомления"  # the topic takes the ticket's name
-    assert tg.edits[-1]["message_id"] == card and "принята" in tg.edits[-1]["text"]
+    told = tg.last(ANNA)
+    assert told["message_thread_id"] == 700 and "принята" in told["text"] and not buttons(told)
     assert await store.draft(ANNA, 700) == {}
-    await bot.handle(tap_in(ANNA, "send:700", 700))  # a second tap creates nothing
-    assert len(yg.tasks) == 1
 
-    # The topic now talks to the ticket: a 👍 says the message got there.
+    # What follows in the topic goes to the ticket: a 👍 says it got there.
+    await bot.handle(photo_in_topic(ANNA, 700))
+    assert len(yg.uploads) == 1 and len(yg.tasks) == 1
     await bot.handle(in_topic(ANNA, 700, "Ещё деталь"))
     assert yg.chats["t-1"][-1]["text"].endswith("Ещё деталь")
     assert tg.reactions[-1]["reaction"] == [{"type": "emoji", "emoji": "👍"}]
@@ -623,6 +614,7 @@ async def test_in_topic_mode_a_new_topic_is_a_new_ticket(bot, store, tg, yg):
     assert tg.last(ANNA)["message_thread_id"] == 700 and "Какой браузер?" in tg.last(ANNA)["text"]
     await bot.handle(in_topic(ANNA, 700, "/new"))
     assert "Как пользоваться ботом" in tg.last(ANNA)["text"]
+    assert "Заявка создаётся сразу" in tg.last(ANNA)["text"]
     await bot.handle(in_topic(ANNA, 700, MINE))
     assert "ID-1" in tg.last(ANNA)["text"] and not buttons(tg.last(ANNA))
 
@@ -635,17 +627,26 @@ async def test_in_topic_mode_a_new_topic_is_a_new_ticket(bot, store, tg, yg):
     assert tg.topics[700] == "✅ ID-1 · Не приходят уведомления"  # kept as history, marked
 
 
-async def test_drafts_in_two_topics_and_a_cancelled_one(bot, store, tg, yg):
+async def test_each_new_topic_is_its_own_ticket_and_old_cards_still_work(bot, store, tg, yg):
     tg.topics_on = True
     await approved(bot, store, tg)
     await bot.handle(in_topic(ANNA, 701, "Первая"))
     await bot.handle(in_topic(ANNA, 702, "Вторая"))
-    await bot.handle(tap_in(ANNA, "cancel:701", 701))
-    assert 701 in tg.deleted_topics and await store.draft(ANNA, 701) == {}
-    await bot.handle(tap_in(ANNA, "send:702", 702))
-    assert [t["title"] for t in yg.tasks.values()] == ["Вторая"]
-    await bot.handle(tap_in(ANNA, "send:701", 701))  # cancelled: nothing
-    assert len(yg.tasks) == 1
+    await bot.handle(photo_in_topic(ANNA, 703))  # a photo alone is a ticket all the same
+    titles = [t["title"] for t in yg.tasks.values()]
+    assert titles == ["Первая", "Вторая", "Заявка из Telegram"] and len(yg.uploads) == 1
+
+    # Drafts and cards left from before the change: their buttons still do their job.
+    draft = {**new_draft(), "title": "Старая", "parts": ["Старая"], "card": 55}
+    await store.save_draft(ANNA, draft, 704)
+    await store.save_draft(ANNA, {**new_draft(), "title": "Ненужная", "parts": ["x"]}, 705)
+    await bot.handle(tap_in(ANNA, "send:704", 704))
+    assert [t["title"] for t in yg.tasks.values()][-1] == "Старая"
+    assert tg.edits[-1]["message_id"] == 55 and "принята" in tg.edits[-1]["text"]
+    await bot.handle(tap_in(ANNA, "cancel:705", 705))
+    assert 705 in tg.deleted_topics and await store.draft(ANNA, 705) == {}
+    await bot.handle(tap_in(ANNA, "send:705", 705))  # cancelled: nothing
+    assert len(yg.tasks) == 4
 
 
 async def test_access_in_topic_mode(bot, store, tg, yg):
@@ -884,24 +885,27 @@ async def test_a_blocked_sender_hears_nothing_and_no_stale_news_later(bot, store
 async def test_a_retried_send_makes_one_ticket(bot, store, tg, yg):
     tg.topics_on = True
     await approved(bot, store, tg)
+    yg.fail_get_once = True  # the task is made, its read fails: the sender is asked to write again
     await bot.handle(in_topic(ANNA, 700, "Не входит в админку"))
-    yg.fail_get_once = True  # the task is made, its read fails: the sender is told to retry
-    await bot.handle(tap_in(ANNA, "send:700", 700))
-    assert "Попробуйте «Отправить» ещё раз" in tg.last(ANNA)["text"]
+    assert "Напишите в эту тему ещё раз" in tg.last(ANNA)["text"]
     assert len(yg.tasks) == 1 and await store.draft(ANNA, 700)
-    await bot.handle(tap_in(ANNA, "send:700", 700))
+    await bot.handle(in_topic(ANNA, 700, "Повторяю"))
     assert len(yg.tasks) == 1, "the same idempotency key: the same task"
     assert (await store.ticket("t-1")).tg_thread_id == 700
     assert tg.topics[700] == "ID-1 · Не входит в админку"
 
 
-async def test_the_same_message_twice_is_added_once(bot, store, tg, yg):
+async def test_the_same_message_twice_reaches_the_ticket_once(bot, store, tg, yg):
     tg.topics_on = True
     await approved(bot, store, tg)
-    update = in_topic(ANNA, 700, "Один раз")
-    await bot.handle(update)
-    await bot.handle(update)  # redelivered after a restart, say
-    assert (await store.draft(ANNA, 700))["parts"] == ["Один раз"]
+    first = in_topic(ANNA, 700, "Один раз")
+    await bot.handle(first)
+    await bot.handle(first)  # redelivered after a restart, say
+    assert len(yg.tasks) == 1 and not yg.chats.get("t-1"), "made of it, not posted again"
+    more = in_topic(ANNA, 700, "Дополнение")
+    await bot.handle(more)
+    await bot.handle(more)
+    assert [m["text"].endswith("Дополнение") for m in yg.chats["t-1"]] == [True]
 
 
 async def test_a_pending_person_writing_again_re_asks_the_approvers(bot, store, tg):
@@ -1014,7 +1018,7 @@ def test_updates_are_ordered_per_person():
     assert _person({"update_id": 1}) == 0
 
 
-async def test_what_a_pending_person_writes_becomes_a_draft_once_approved(bot, store, tg, yg):
+async def test_what_a_pending_person_writes_becomes_tickets_once_approved(bot, store, tg, yg):
     tg.topics_on = True
     a = await account(store)
     await bot.handle(in_topic(EVE, 900, "/start"))
@@ -1025,9 +1029,9 @@ async def test_what_a_pending_person_writes_becomes_a_draft_once_approved(bot, s
     await bot.handle(in_topic(EVE, 900, "Не грузится отчёт\nС утра, на Невском"))
     told = tg.last(EVE)
     assert told["message_thread_id"] == 900 and "заявки отправлять нельзя" in told["text"]
-    assert "станет черновиком" in told["text"] and not buttons(told) and yg.tasks == {}
+    assert "сразу станет заявкой" in told["text"] and not buttons(told) and yg.tasks == {}
     await bot.handle(photo_in_topic(EVE, 900))
-    await bot.handle(in_topic(EVE, 905, "Вторая проблема"))  # another topic, another draft
+    await bot.handle(in_topic(EVE, 905, "Вторая проблема"))  # another topic, another ticket
 
     note = await store.draft(EVE)  # ten minutes on: the request goes again, nothing held is lost
     await store.save_draft(EVE, {**note, "asked": 0})
@@ -1038,22 +1042,19 @@ async def test_what_a_pending_person_writes_becomes_a_draft_once_approved(bot, s
     await bot.handle(tap_in(ADMIN, f"ok:{EVE}:{a.id}:p-client", request["message_thread_id"]))
     sent = [m for m in tg.sent if m["chat_id"] == EVE]
     welcome = next(m for m in sent if "Доступ открыт" in m["text"])
-    assert "оставлять заявки" in welcome["text"] and "в черновике ниже" in welcome["text"]
-    cards = {m["message_thread_id"]: m for m in sent if buttons(m)}
-    assert (
-        buttons(cards[900]) == ["send:900", "cancel:900"]
-        and "Не грузится отчёт" in cards[900]["text"]
-    )
-    assert "файлов: 1" in cards[900]["text"] and "Вторая проблема" in cards[905]["text"]
+    assert "оставлять заявки" in welcome["text"] and "отправил заявками" in welcome["text"]
+    by_title = {t["title"]: t for t in yg.tasks.values()}
+    assert set(by_title) == {"Не грузится отчёт", "Вторая проблема"}
+    assert "на Невском" in by_title["Не грузится отчёт"]["description"]
+    assert "ещё к второй" in by_title["Вторая проблема"]["description"] and len(yg.uploads) == 1
+    assert {(await store.ticket(t["id"])).tg_thread_id for t in yg.tasks.values()} == {900, 905}
+    accepted = [m for m in sent if "принята" in m["text"]]
+    assert sorted(m["message_thread_id"] for m in accepted) == [900, 905], "each in its topic"
     assert await store.draft(EVE) == {}, "the waiting note is gone"
-
-    await bot.handle(tap_in(EVE, "send:900", 900))
-    task = yg.tasks["t-1"]
-    assert task["title"] == "Не грузится отчёт" and "на Невском" in task["description"]
-    assert len(yg.uploads) == 1 and await store.draft(EVE, 905)
+    assert not any(buttons(m) for m in sent)
 
 
-async def test_approval_without_anything_held_says_nothing_of_drafts(bot, store, tg, yg):
+async def test_approval_without_anything_held_says_nothing_of_tickets(bot, store, tg, yg):
     tg.topics_on = True
     a = await account(store)
     await bot.handle(in_topic(EVE, 900, "/start"))
@@ -1061,7 +1062,7 @@ async def test_approval_without_anything_held_says_nothing_of_drafts(bot, store,
     await bot.handle(
         tap_in(ADMIN, f"ok:{EVE}:{a.id}:p-client", tg.last(ADMIN)["message_thread_id"])
     )
-    assert "Доступ открыт" in tg.last(EVE)["text"] and "черновике" not in tg.last(EVE)["text"]
+    assert "Доступ открыт" in tg.last(EVE)["text"] and "отправил" not in tg.last(EVE)["text"]
     assert not any(buttons(m) for m in tg.sent if m["chat_id"] == EVE)
 
 
