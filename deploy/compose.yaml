@@ -7,11 +7,13 @@
 
 name: yougile-mcp-cloud
 
+# Logs go to the host's journal, so they outlive the containers a deploy replaces:
+#   sudo journalctl CONTAINER_NAME=yougile-mcp-cloud-tickets-1 --since "2 hours ago"
+# `docker compose logs` keeps working (Docker's dual logging). Retention: journald's own limits.
 x-logging: &logging
-  driver: json-file
+  driver: journald
   options:
-    max-size: "10m"
-    max-file: "3"
+    tag: "{{.Name}}"
 
 services:
   app:

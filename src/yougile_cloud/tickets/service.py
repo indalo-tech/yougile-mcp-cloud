@@ -33,6 +33,8 @@ log = logging.getLogger(__name__)
 HOOK_PREFIX = "/tickets/hook/"
 RECONCILE_PAUSE = 2.0  # seconds between tickets in the periodic check
 CONCURRENT_UPDATES = 8  # Telegram updates handled at once (one person's stay in order)
+FIRST_CHECK = 60.0  # seconds after start: what a restart missed goes out within minutes
+DRAIN_SECONDS = 8.0  # on stop, updates being handled get this long (Docker waits 10 s)
 WEBHOOK_EVENTS = ("task-.*", "chat_message-created")
 
 
@@ -220,35 +222,51 @@ class TicketService:
         with contextlib.suppress(TelegramError):
             await tg.call("deleteWebhook")  # long polling and a webhook exclude each other
         await bot.setup()
-        while True:
-            try:
-                updates = await tg.updates(offset)
-            except TelegramError as exc:
-                log.warning("getUpdates: %s", exc)
-                await asyncio.sleep(5)
-                continue
-            for update in updates:
-                offset = update["update_id"] + 1
-                # Handled side by side (a ticket with files must not hold everyone up), but in
-                # order for each person: their lock is taken in arrival order.
-                person = _person(update)
-                people.setdefault(person, [asyncio.Lock(), 0])[1] += 1
-                task = asyncio.create_task(_one(update, person))
-                running.add(task)
-                task.add_done_callback(running.discard)
+        try:
+            while True:
+                try:
+                    updates = await tg.updates(offset)
+                except TelegramError as exc:
+                    log.warning("getUpdates: %s", exc)
+                    await asyncio.sleep(5)
+                    continue
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    # Handled side by side (a ticket with files must not hold everyone up), but
+                    # in order for each person: their lock is taken in arrival order.
+                    person = _person(update)
+                    people.setdefault(person, [asyncio.Lock(), 0])[1] += 1
+                    task = asyncio.create_task(_one(update, person))
+                    running.add(task)
+                    task.add_done_callback(running.discard)
+        finally:
+            # Telegram already counts these as delivered: a stop (a deploy) lets them finish
+            # instead of dropping what someone just wrote.
+            if running:
+                log.info("stopping: %d update(s) still being handled", len(running))
+                _done, left = await asyncio.wait(set(running), timeout=DRAIN_SECONDS)
+                for task in left:
+                    task.cancel()
+                if left:
+                    log.warning("stopped with %d update(s) unfinished", len(left))
 
     async def _reconcile(self) -> None:
-        """Webhooks can be lost: look at every open ticket now and then."""
+        """Webhooks can be lost: look at every open ticket now and then — and soon after a
+        start, since webhooks and failed reports of the previous run are gone with it."""
+        first = True
         while True:
-            await asyncio.sleep(self.tickets.reconcile_seconds)
+            await asyncio.sleep(FIRST_CHECK if first else self.tickets.reconcile_seconds)
             if self.bot is None:
                 continue
             try:
                 await self.bot.store.drop_stale_drafts()
                 await self.bot.store.prune_messages()
-                await self.bot.refresh_open(
-                    fresh_within=self.tickets.reconcile_seconds, pause=RECONCILE_PAUSE
+                failed = await self.bot.refresh_open(
+                    fresh_within=0 if first else self.tickets.reconcile_seconds,
+                    pause=RECONCILE_PAUSE,
                 )
+                log.info("open tickets checked (%d failed)", failed)
+                first = False
             except Exception:
                 log.exception("checking open tickets failed")
 

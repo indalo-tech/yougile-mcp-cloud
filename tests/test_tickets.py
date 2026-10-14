@@ -1063,3 +1063,68 @@ async def test_approval_without_anything_held_says_nothing_of_drafts(bot, store,
     )
     assert "Доступ открыт" in tg.last(EVE)["text"] and "черновике" not in tg.last(EVE)["text"]
     assert not any(buttons(m) for m in tg.sent if m["chat_id"] == EVE)
+
+
+class _PollTelegram:
+    """One update, then a long poll that never answers."""
+
+    def __init__(self) -> None:
+        self.polls = 0
+
+    async def call(self, *_args: Any, **_kw: Any) -> bool:
+        return True
+
+    async def updates(self, _offset: int | None) -> list[dict]:
+        import asyncio
+
+        self.polls += 1
+        if self.polls == 1:
+            return [{"update_id": 1, "message": {"from": {"id": 5}, "chat": {"id": 5}}}]
+        await asyncio.sleep(3600)
+        return []
+
+
+class _SlowBot:
+    def __init__(self, gate: Any) -> None:
+        self.gate, self.handled = gate, []
+
+    async def setup(self) -> None:
+        pass
+
+    async def handle(self, update: dict) -> None:
+        await self.gate.wait()
+        self.handled.append(update["update_id"])
+
+
+async def test_a_stop_lets_the_updates_in_hand_finish():
+    import asyncio
+    import contextlib
+
+    from yougile_cloud.tickets.service import TicketService
+
+    gate = asyncio.Event()
+    bot = _SlowBot(gate)
+    poller = asyncio.create_task(TicketService._poll(_PollTelegram(), bot))
+    await asyncio.sleep(0.05)
+    poller.cancel()  # a deploy stops the bot while it handles someone's message
+    await asyncio.sleep(0.05)
+    gate.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await poller
+    assert bot.handled == [1], "Telegram counts it delivered: it must not be dropped"
+
+
+async def test_a_stop_does_not_wait_forever(monkeypatch):
+    import asyncio
+    import contextlib
+
+    from yougile_cloud.tickets import service
+
+    monkeypatch.setattr(service, "DRAIN_SECONDS", 0.05)
+    bot = _SlowBot(asyncio.Event())  # never let through
+    poller = asyncio.create_task(service.TicketService._poll(_PollTelegram(), bot))
+    await asyncio.sleep(0.05)
+    poller.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(poller, 2)
+    assert bot.handled == []
