@@ -61,7 +61,7 @@ PENDING = (
     "Пока доступа нет — заявки отправлять нельзя. Как только администратор одобрит запрос, "
     "я напишу."
 )
-HELD = " То, что вы пишете сейчас, я сохраню: после одобрения это станет черновиком заявки."
+HELD = " То, что вы пишете сейчас, я сохраню: после одобрения это сразу станет заявкой."
 ASK_TITLE = "Коротко: что нужно сделать или что не работает? Одной строкой — это будет заголовок."
 ASK_DETAILS = (
     "Опишите подробнее: где, что происходит, что ожидали. Можно приложить фото и файлы.\n"
@@ -75,14 +75,12 @@ THREAD_HELP = """📘 <b>Как пользоваться ботом</b>
 
 <b>Отправить заявку</b>
 1. Начните новую тему: значок ✏️ над списком тем или поле «Новая тема».
-2. Первой строкой напишите коротко, что нужно сделать или что не работает, — это станет \
-заголовком. Например: «Не приходят уведомления о записи».
-3. Добавьте подробности: где и когда это происходит, что вы ожидали. Можно несколькими \
-сообщениями, со скриншотами, фото, файлами и голосовыми (до 10 файлов, каждый до 20 МБ).
-4. Под последним сообщением появится черновик заявки. Проверьте его и нажмите \
-«✅ Отправить». «✖️ Отменить» удалит черновик вместе с темой.
+2. Напишите, что нужно сделать или что не работает. Первая строка станет заголовком, \
+например: «Не приходят уведомления о записи». Заявка создаётся сразу, по первому сообщению.
+3. Подробности — где и когда это происходит, что вы ожидали — пишите следом в ту же тему: \
+текстом, скриншотами, фото, файлами, голосовыми (файл до 20 МБ). Всё уйдёт в заявку.
 
-<b>После отправки</b>
+<b>Дальше</b>
 • Тема получит номер и заголовок заявки, например «ID-1234 · Не приходят уведомления».
 • В ней будут приходить смена статуса (в работе, на проверке, готово) и вопросы команды.
 • Чтобы ответить или что-то дополнить, пишите в эту же тему: текст, фото, файлы. 👍 на \
@@ -93,15 +91,16 @@ THREAD_HELP = """📘 <b>Как пользоваться ботом</b>
 <b>Важно</b>
 • Одна тема — одна заявка. Новую задачу начинайте новой темой, даже если она похожа на \
 прежнюю.
-• Дополнения к заявке пишите внутри её темы: сообщение в общем окне чата начнёт новую \
-заявку.
+• Дополнения к заявке пишите внутри её темы: сообщение в новой теме — это новая заявка.
+• Ошиблись или заявка больше не нужна — напишите об этом в её теме, команда её снимет.
 • Не присылайте пароли и данные банковских карт.
 • Список ваших заявок — /my, эта инструкция — /help (кнопка «Меню»)."""
 DESCRIPTION = (
     "Бот для заявок команде Indalo: задачи, ошибки, вопросы по нашим системам.\n\n"
     "Как начать: нажмите «Старт» и напишите, как вас зовут и из какой вы компании. После "
     "подтверждения доступа бот пришлёт инструкцию.\n\n"
-    "Каждая заявка — отдельная тема: в ней статус и вопросы команды, туда же пишете ответы."
+    "Каждая заявка — отдельная тема: напишите в новой теме — заявка создастся сразу. В теме "
+    "приходят статус и вопросы команды, туда же пишете ответы."
 )
 SHORT_DESCRIPTION = "Заявки команде Indalo: отправляйте задачи и следите за их статусом в Telegram."
 NO_TOPIC = (
@@ -424,7 +423,9 @@ class TicketBot:
         if text in ("/cancel", "Отмена", "Отменить"):
             await self.cancel_topic(chat, uid, thread)
             return
-        await self.compose(chat, uid, thread, msg, text)
+        # No draft and no «send» step: the first message of a new topic is the ticket.
+        if await self.compose(chat, uid, thread, msg, text):
+            await self.submit_topic(chat, sender, thread)
 
     async def unplaced(self, msg: dict, sender: Sender, text: str) -> None:
         """Topics on, yet no topic on the message: it was written in a topic the bot made (those
@@ -442,37 +443,31 @@ class TicketBot:
             return
         await self.reply(chat, NO_TOPIC, markup=NO_MENU)
 
-    async def compose(self, chat: int, uid: int, thread: int, msg: dict, text: str) -> None:
+    async def compose(self, chat: int, uid: int, thread: int, msg: dict, text: str) -> bool:
+        """Add a message to the topic's draft (a new one, or one left by a failed send or by
+        the card flow of before); True when the draft is ready to become the ticket."""
         content = text or (msg.get("caption") or "").strip()
         file = attachment(msg)
         if content.startswith("/"):
             content = ""
         if not content and not file:
             await self.reply(chat, "Пришлите текст, фото, голосовое или файл.")
-            return
+            return False
         if file and file["size"] > MAX_DOWNLOAD:
             await self.reply(chat, "Файл больше 20 МБ: бот такие не принимает. Пришлите ссылку.")
-            return
+            return False
         async with self._locks[f"draft:{uid}:{thread}"]:
             draft = await self.store.draft(uid, thread) or new_draft()
             seen = draft.setdefault("seen", [])
             if msg.get("message_id") in seen:
-                return  # the same update again (after a restart, say)
+                return False  # the same update again (after a restart, say)
             if content:
                 draft["title"] = draft["title"] or clip(first_line(content), MAX_TITLE)
                 draft["parts"].append(content)
-            if file:
-                if len(draft["files"]) >= MAX_FILES:
-                    await self.reply(chat, f"Не больше {MAX_FILES} файлов на заявку.")
-                    return
+            if file and len(draft["files"]) < MAX_FILES:
                 draft["files"].append(file)
             seen.append(msg.get("message_id"))
-            # Saved before anything is sent: a failed card must not lose what was written.
-            await self.store.save_draft(uid, draft, thread)
-            # The card with the buttons follows the latest message, so it stays at hand.
-            old = draft.get("card")
-            card = await self.reply(chat, draft_card(draft), markup=topic_buttons(thread))
-            draft["card"] = card["message_id"]
+            # Saved before the ticket is made: a failed send must not lose what was written.
             await self.store.save_draft(uid, draft, thread)
         log.info(
             "draft of %s in topic %s: %d part(s), %d file(s)",
@@ -481,11 +476,7 @@ class TicketBot:
             len(draft["parts"]),
             len(draft["files"]),
         )
-        if old:
-            try:
-                await self.tg.call("deleteMessage", chat_id=chat, message_id=old)
-            except TelegramError as exc:
-                log.info("deleteMessage: %s", exc)
+        return True
 
     async def cancel_topic(self, chat: int, uid: int, thread: int) -> None:
         if await self.store.ticket_of_thread(chat, thread):
@@ -511,6 +502,11 @@ class TicketBot:
                 return
             task, number, desk = made
             await self.store.update_ticket(task["id"], tg_thread_id=thread)
+            # The messages it was made of count as delivered: one coming again (Telegram
+            # redelivers after a restart) is not posted into the ticket a second time.
+            for seen in draft.get("seen") or []:
+                if seen:
+                    await self.store.link_message(chat, seen, task["id"])
             await self.store.save_draft(uid, {}, thread)
         log.info("ticket %s created by %s from topic %s", number, uid, thread)
         failed = await self.upload(desk, task["id"], draft.get("files") or [])
@@ -563,7 +559,9 @@ class TicketBot:
         except YouGileError as exc:
             log.warning("cannot create a ticket in %s: %s", project.title, exc)
             await self.reply(
-                chat, "Не получилось создать заявку. Попробуйте «Отправить» ещё раз чуть позже."
+                chat,
+                "Не получилось создать заявку. Напишите в эту тему ещё раз чуть позже — "
+                "всё написанное сохранено, заявка создастся.",
             )
             return None
         number = task.get("idTaskCommon") or task["id"]
@@ -703,29 +701,34 @@ class TicketBot:
             await self.store.save_draft(uid, note)
         return True
 
-    async def release_held(self, uid: int, held: dict) -> int:
-        """After approval: what was written while waiting becomes a draft in its topic, with
-        the send card under it. A topic that already has a draft keeps it. Returns how many."""
-        released = 0
+    async def release_held(self, sender: Sender, held: dict) -> int:
+        """After approval: what was written in each topic while waiting becomes its ticket at
+        once, as a first message there would. A topic that has a draft or a ticket already
+        keeps it. Returns how many tickets were made."""
+        uid, made = sender.tg_user_id, 0
         for key, draft in held.items():
             thread = int(key)
             if not draft.get("parts") and not draft.get("files"):
+                continue
+            if await self.store.ticket_of_thread(uid, thread):
                 continue
             async with self._locks[f"draft:{uid}:{thread}"]:
                 if await self.store.draft(uid, thread):
                     continue
                 await self.store.save_draft(uid, draft, thread)
-                try:
-                    card = await self.tg.send(
-                        uid, draft_card(draft), markup=topic_buttons(thread), thread=thread
-                    )
-                except TelegramError as exc:
-                    log.info("cannot show a held draft to %s: %s", uid, exc)
-                    continue
-                draft["card"] = card["message_id"]
-                await self.store.save_draft(uid, draft, thread)
-                released += 1
-        return released
+            # Answers of this step belong in that topic, not in the approver's.
+            token = _thread.set(thread)
+            incoming = _incoming.set(None)
+            try:
+                await self.submit_topic(uid, sender, thread)
+            except Exception:
+                log.exception("a held ticket of %s in topic %s failed", uid, thread)
+                continue  # its draft stays: the person's next message there sends it
+            finally:
+                _thread.reset(token)
+                _incoming.reset(incoming)
+            made += 1
+        return made
 
     async def choices(self) -> list[tuple[str, str]]:
         """Approval buttons: one per project with a «Заявки» board, in every account."""
@@ -827,8 +830,8 @@ class TicketBot:
         if project:
             help_text = await self.help_text()
             waiting = (
-                "\n\nТо, что вы писали, пока ждали доступа, — в черновике ниже: проверьте и "
-                "нажмите «✅ Отправить»."
+                "\n\nТо, что вы писали, пока ждали доступа, я отправил заявками — каждая в "
+                "своей теме."
                 if any(d.get("parts") or d.get("files") for d in held.values())
                 else ""
             )
@@ -836,7 +839,7 @@ class TicketBot:
                 target,
                 f"Доступ открыт — теперь можно оставлять заявки.{waiting}\n\n{help_text}",
             )
-            await self.release_held(target, held)
+            await self.release_held(sender, held)
         else:
             await self.tell(target, "К сожалению, в доступе отказано.")
         return "Готово"
@@ -1056,9 +1059,14 @@ class TicketBot:
         if not text and not file:
             await self.reply(chat, "Пришлите текст, фото или файл.")
             return
+        mid = msg.get("message_id")
+        if mid and await self.store.ticket_of_message(chat, mid) == task_id:
+            return  # delivered already: the same update again
         header = f"{sender.name} ({sender.project_name}) пишет из Telegram:"
         try:
             await desk.post(task_id, f"{header}\n{text}" if text else f"{header} файл")
+            if mid:
+                await self.store.link_message(chat, mid, task_id)
             failed = await self.upload(desk, task_id, [file]) if file else []
         except YouGileError as exc:
             log.warning("relaying to %s failed: %s", ticket.number, exc)
