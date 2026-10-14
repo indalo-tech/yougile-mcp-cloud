@@ -169,8 +169,14 @@ async def clean() -> None:
     db = Database(DB_URL, max_size=2)
     await db.open()
     await db.migrate()
+    # Every table but the migrations' own, read from the catalog: a table a new migration adds
+    # (the ticket bot's, say) is cleaned too, and a reused database starts each test empty.
+    tables = await db._all(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+        "AND tablename <> 'schema_migrations'"
+    )
     await db._exec(
-        "TRUNCATE audit_log, refresh_tokens, oauth_clients, user_rights, users, companies CASCADE"
+        "TRUNCATE " + ", ".join(f'"{r["tablename"]}"' for r in tables) + " RESTART IDENTITY CASCADE"
     )
     await db.close()
     kv = await KV.connect(VALKEY_URL)
