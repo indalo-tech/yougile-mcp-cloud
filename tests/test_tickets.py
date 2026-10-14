@@ -321,7 +321,7 @@ async def test_access_needs_an_approver(bot, store, tg):
     await bot.handle(tap(EVE, f"ok:{ANNA}:{a.id}:p-client"))  # not an approver
     assert (await store.sender(ANNA)).status == "pending"
     await bot.handle(text(ANNA, NEW))
-    assert "рассматривается" in tg.to(ANNA)[-1]
+    assert "Пока доступа нет" in tg.to(ANNA)[-1]
 
     await bot.handle(tap(ADMIN, f"ok:{ANNA}:{a.id}:p-internal"))  # no «Заявки» there
     assert (await store.sender(ANNA)).status == "pending"
@@ -915,7 +915,7 @@ async def test_a_pending_person_writing_again_re_asks_the_approvers(bot, store, 
     await store.save_draft(EVE, {"step": "pending", "asked": 0})  # ten minutes later
     await bot.handle(text(EVE, "ну что там?"))
     assert asks() == 2
-    assert "рассматривается" in tg.to(EVE)[-1]
+    assert "Пока доступа нет" in tg.to(EVE)[-1]
 
 
 async def test_a_getme_blip_keeps_topics_on(bot, tg, no_connect_retries):
@@ -1012,3 +1012,54 @@ def test_updates_are_ordered_per_person():
     assert _person(text(ANNA, "x")) == ANNA
     assert _person(tap(EVE, "send")) == EVE
     assert _person({"update_id": 1}) == 0
+
+
+async def test_what_a_pending_person_writes_becomes_a_draft_once_approved(bot, store, tg, yg):
+    tg.topics_on = True
+    a = await account(store)
+    await bot.handle(in_topic(EVE, 900, "/start"))
+    await bot.handle(in_topic(EVE, 900, "Ева, Подружки"))
+    assert "Пока доступа нет" in tg.last(EVE)["text"] and "сохраню" in tg.last(EVE)["text"]
+    request = tg.last(ADMIN)
+
+    await bot.handle(in_topic(EVE, 900, "Не грузится отчёт\nС утра, на Невском"))
+    told = tg.last(EVE)
+    assert told["message_thread_id"] == 900 and "заявки отправлять нельзя" in told["text"]
+    assert "станет черновиком" in told["text"] and not buttons(told) and yg.tasks == {}
+    await bot.handle(photo_in_topic(EVE, 900))
+    await bot.handle(in_topic(EVE, 905, "Вторая проблема"))  # another topic, another draft
+
+    note = await store.draft(EVE)  # ten minutes on: the request goes again, nothing held is lost
+    await store.save_draft(EVE, {**note, "asked": 0})
+    await bot.handle(in_topic(EVE, 905, "ещё к второй"))
+    assert sum("Запрос доступа" in m for m in tg.to(ADMIN)) == 2
+    assert (await store.draft(EVE))["held"]["905"]["parts"] == ["Вторая проблема", "ещё к второй"]
+
+    await bot.handle(tap_in(ADMIN, f"ok:{EVE}:{a.id}:p-client", request["message_thread_id"]))
+    sent = [m for m in tg.sent if m["chat_id"] == EVE]
+    welcome = next(m for m in sent if "Доступ открыт" in m["text"])
+    assert "оставлять заявки" in welcome["text"] and "в черновике ниже" in welcome["text"]
+    cards = {m["message_thread_id"]: m for m in sent if buttons(m)}
+    assert (
+        buttons(cards[900]) == ["send:900", "cancel:900"]
+        and "Не грузится отчёт" in cards[900]["text"]
+    )
+    assert "файлов: 1" in cards[900]["text"] and "Вторая проблема" in cards[905]["text"]
+    assert await store.draft(EVE) == {}, "the waiting note is gone"
+
+    await bot.handle(tap_in(EVE, "send:900", 900))
+    task = yg.tasks["t-1"]
+    assert task["title"] == "Не грузится отчёт" and "на Невском" in task["description"]
+    assert len(yg.uploads) == 1 and await store.draft(EVE, 905)
+
+
+async def test_approval_without_anything_held_says_nothing_of_drafts(bot, store, tg, yg):
+    tg.topics_on = True
+    a = await account(store)
+    await bot.handle(in_topic(EVE, 900, "/start"))
+    await bot.handle(in_topic(EVE, 900, "Ева"))
+    await bot.handle(
+        tap_in(ADMIN, f"ok:{EVE}:{a.id}:p-client", tg.last(ADMIN)["message_thread_id"])
+    )
+    assert "Доступ открыт" in tg.last(EVE)["text"] and "черновике" not in tg.last(EVE)["text"]
+    assert not any(buttons(m) for m in tg.sent if m["chat_id"] == EVE)
