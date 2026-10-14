@@ -474,6 +474,13 @@ class TicketBot:
             card = await self.reply(chat, draft_card(draft), markup=topic_buttons(thread))
             draft["card"] = card["message_id"]
             await self.store.save_draft(uid, draft, thread)
+        log.info(
+            "draft of %s in topic %s: %d part(s), %d file(s)",
+            uid,
+            thread,
+            len(draft["parts"]),
+            len(draft["files"]),
+        )
         if old:
             try:
                 await self.tg.call("deleteMessage", chat_id=chat, message_id=old)
@@ -505,6 +512,7 @@ class TicketBot:
             task, number, desk = made
             await self.store.update_ticket(task["id"], tg_thread_id=thread)
             await self.store.save_draft(uid, {}, thread)
+        log.info("ticket %s created by %s from topic %s", number, uid, thread)
         failed = await self.upload(desk, task["id"], draft.get("files") or [])
         ticket = await self.store.ticket(task["id"])
         assert ticket is not None
@@ -641,6 +649,7 @@ class TicketBot:
             if again:
                 await self.ask_approvers(sender, msg["from"])
             held = await self.hold(msg, sender, text)
+            log.info("pending sender %s wrote (kept: %s)", uid, held)
             await self.reply(chat, PENDING + (HELD if held else ""))
             return
         draft = await self.store.draft(uid)
@@ -1055,6 +1064,7 @@ class TicketBot:
             log.warning("relaying to %s failed: %s", ticket.number, exc)
             await self.reply(chat, "Не получилось передать сообщение. Попробуйте позже.")
             return
+        log.info("relayed a message of %s to %s", sender.tg_user_id, ticket.number)
         # A 👍 on the message says it reached the ticket, without another message.
         if not failed:
             try:
@@ -1306,4 +1316,7 @@ class TicketBot:
         except TelegramError as exc:
             if not exc.permanent:
                 raise  # Telegram unreachable: nothing is marked as told, it is tried again
-            log.info("cannot notify about %s: %s", ticket.number, exc)  # blocked the bot
+            # Not told, and not tried again: worth a warning, the sender may be waiting.
+            log.warning("cannot notify %s about %s: %s", ticket.tg_user_id, ticket.number, exc)
+            return
+        log.info("told %s about %s", ticket.tg_user_id, ticket.number)
