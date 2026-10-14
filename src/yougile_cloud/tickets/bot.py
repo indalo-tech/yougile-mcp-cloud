@@ -57,6 +57,11 @@ ASK_NAME = (
     "Как вас зовут и из какой вы компании? Ответьте одним сообщением — "
     "после подтверждения доступа сможете отправлять заявки."
 )
+PENDING = (
+    "Пока доступа нет — заявки отправлять нельзя. Как только администратор одобрит запрос, "
+    "я напишу."
+)
+HELD = " То, что вы пишете сейчас, я сохраню: после одобрения это станет черновиком заявки."
 ASK_TITLE = "Коротко: что нужно сделать или что не работает? Одной строкой — это будет заголовок."
 ASK_DETAILS = (
     "Опишите подробнее: где, что происходит, что ожидали. Можно приложить фото и файлы.\n"
@@ -626,13 +631,17 @@ class TicketBot:
         if sender and sender.status == "pending":
             # The request may never have reached an approver (Telegram down at the time) or
             # been missed: a person writing again after a while sends it once more.
-            draft = await self.store.draft(uid)
-            if time.time() - float(draft.get("asked") or 0) > REASK_AFTER:
-                await self.store.save_draft(uid, {"step": "pending", "asked": time.time()})
+            async with self._locks[f"draft:{uid}:0"]:
+                note = await self.store.draft(uid)
+                again = time.time() - float(note.get("asked") or 0) > REASK_AFTER
+                if again:  # what is held stays: only the time of asking changes
+                    await self.store.save_draft(
+                        uid, {**note, "step": "pending", "asked": time.time()}
+                    )
+            if again:
                 await self.ask_approvers(sender, msg["from"])
-            await self.reply(
-                chat, "Запрос на доступ ещё рассматривается. Напишу, как только решат."
-            )
+            held = await self.hold(msg, sender, text)
+            await self.reply(chat, PENDING + (HELD if held else ""))
             return
         draft = await self.store.draft(uid)
         if draft.get("step") != "intro" or not text or text.startswith("/"):
@@ -645,7 +654,69 @@ class TicketBot:
         )
         await self.store.save_draft(uid, {"step": "pending", "asked": time.time()})
         await self.ask_approvers(sender, user)
-        await self.reply(chat, "Спасибо! Запрос на доступ отправлен. Напишу, когда его одобрят.")
+        topics = await self.topics_enabled()
+        await self.reply(
+            chat,
+            "Спасибо! Запрос на доступ отправлен. "
+            + PENDING
+            + (" Можете уже описать проблему — сохраню до одобрения." if topics else ""),
+        )
+
+    async def hold(self, msg: dict, sender: Sender, text: str) -> bool:
+        """Topic mode: what a person writes while waiting for access is kept, per topic, and
+        becomes a draft once they are let in — Telegram gives a bot no history to read later.
+        Returns whether the message was kept."""
+        if not await self.topics_enabled():
+            return False
+        thread = thread_of(msg) or sender.tg_thread_id
+        content = text or (msg.get("caption") or "").strip()
+        if content.startswith("/"):
+            content = ""
+        file = attachment(msg)
+        if file and file["size"] > MAX_DOWNLOAD:
+            file = None
+        if not thread or (not content and not file):
+            return False
+        uid = sender.tg_user_id
+        async with self._locks[f"draft:{uid}:0"]:
+            note = await self.store.draft(uid)
+            draft = note.setdefault("held", {}).setdefault(str(thread), new_draft())
+            seen = draft.setdefault("seen", [])
+            if msg.get("message_id") in seen:
+                return True  # the same update again
+            if content:
+                draft["title"] = draft["title"] or clip(first_line(content), MAX_TITLE)
+                draft["parts"].append(content)
+            if file and len(draft["files"]) < MAX_FILES:
+                draft["files"].append(file)
+            seen.append(msg.get("message_id"))
+            note.setdefault("step", "pending")
+            await self.store.save_draft(uid, note)
+        return True
+
+    async def release_held(self, uid: int, held: dict) -> int:
+        """After approval: what was written while waiting becomes a draft in its topic, with
+        the send card under it. A topic that already has a draft keeps it. Returns how many."""
+        released = 0
+        for key, draft in held.items():
+            thread = int(key)
+            if not draft.get("parts") and not draft.get("files"):
+                continue
+            async with self._locks[f"draft:{uid}:{thread}"]:
+                if await self.store.draft(uid, thread):
+                    continue
+                await self.store.save_draft(uid, draft, thread)
+                try:
+                    card = await self.tg.send(
+                        uid, draft_card(draft), markup=topic_buttons(thread), thread=thread
+                    )
+                except TelegramError as exc:
+                    log.info("cannot show a held draft to %s: %s", uid, exc)
+                    continue
+                draft["card"] = card["message_id"]
+                await self.store.save_draft(uid, draft, thread)
+                released += 1
+        return released
 
     async def choices(self) -> list[tuple[str, str]]:
         """Approval buttons: one per project with a «Заявки» board, in every account."""
@@ -741,13 +812,22 @@ class TicketBot:
             verdict = "❌ Отклонено"
         if sender is None:
             return "Запрос не найден"
+        held = (await self.store.draft(target)).get("held") or {}
         await self.store.save_draft(target, {})  # the «request pending» note
         await self.mark(msg, verdict)
         if project:
             help_text = await self.help_text()
-            await self.tell(
-                target, f"Доступ открыт. Теперь можно отправлять заявки.\n\n{help_text}"
+            waiting = (
+                "\n\nТо, что вы писали, пока ждали доступа, — в черновике ниже: проверьте и "
+                "нажмите «✅ Отправить»."
+                if any(d.get("parts") or d.get("files") for d in held.values())
+                else ""
             )
+            await self.tell(
+                target,
+                f"Доступ открыт — теперь можно оставлять заявки.{waiting}\n\n{help_text}",
+            )
+            await self.release_held(target, held)
         else:
             await self.tell(target, "К сожалению, в доступе отказано.")
         return "Готово"
