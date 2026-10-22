@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "Indalo" }]
 dependencies = [
-    "yougile-mcp[apps]>=0.21.2",  # apps: the MCP Apps screens
+    "yougile-mcp[apps]>=0.21.3",  # apps: the MCP Apps screens
     "psycopg[binary,pool]>=3.3.6",
     "valkey-glide>=2.5.2",
     "cryptography>=50",
@@ -22,7 +22,7 @@ yougile-cloud = "yougile_cloud.__main__:main"
 dev = [
     "pytest>=9.1",
     "pytest-asyncio>=1.4",
-    "ruff>=0.16",
+    "ruff>=0.17",
 ]
 
 [build-system]
