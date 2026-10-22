@@ -64,6 +64,7 @@ jobs:
         with:
           context: .
           push: true
+          pull: true  # a fresh base image every build: OS security fixes are not left behind
           # An immutable tag per commit (what deploys use, and what a rollback pins) and latest.
           tags: |
             ghcr.io/indalo-tech/yougile-mcp-cloud:${{ steps.tag.outputs.tag }}
