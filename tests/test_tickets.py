@@ -207,7 +207,7 @@ async def store():
     await db.migrate()
     await db._exec(
         "TRUNCATE ticket_bot, ticket_admin_topics, ticket_drafts, ticket_tg_messages, tickets, "
-        "ticket_senders, ticket_accounts CASCADE"
+        "ticket_senders, ticket_accounts, ticket_actions, audit_log CASCADE"
     )
     yield TicketStore(db)
     await db.close()
@@ -414,8 +414,12 @@ async def test_an_approver_moves_a_sender_to_another_project(bot, store, tg, yg)
 
     await bot.handle(text(ADMIN, "/senders"))
     listing = [m for m in tg.sent if m["chat_id"] == ADMIN][-1]
-    assert buttons(listing) == [f"mvl:{ANNA}"]
+    assert buttons(listing) == [f"who:{ANNA}"]
     assert "Работы" in listing["reply_markup"]["inline_keyboard"][0][0]["text"]
+    await bot.handle(tap(ADMIN, f"who:{ANNA}"))
+    card = tg.last(ADMIN)
+    assert buttons(card) == [f"mvl:{ANNA}", f"rv:{ANNA}", f"bl:{ANNA}"]
+    assert "одобрен, проект: Работы" in card["text"]
     await bot.handle(tap(ADMIN, f"mvl:{ANNA}"))
     offer = [m for m in tg.sent if m["chat_id"] == ADMIN][-1]
     assert buttons(offer) == [f"mv:{ANNA}:{a}:p-other"]  # the current project is not offered
@@ -1129,3 +1133,97 @@ async def test_a_stop_does_not_wait_forever(monkeypatch):
     with contextlib.suppress(asyncio.CancelledError):
         await asyncio.wait_for(poller, 2)
     assert bot.handled == []
+
+
+# ---------------- managing people after the first decision ----------------
+
+
+async def test_revoke_block_and_unblock(bot, store, tg, yg):
+    await approved(bot, store, tg)
+    await ticket(bot, tg)
+
+    await bot.handle(tap(ADMIN, f"rv:{ANNA}"))
+    assert (await store.sender(ANNA)).status == "revoked"
+    assert "Доступ к заявкам закрыт" in tg.to(ANNA)[-1]
+    assert "доступ отозван" in tg.edits[-1]["text"]
+    yg.tasks["t-1"]["columnId"] = "c-work"  # their old ticket's news no longer reach them
+    before = len(tg.to(ANNA))
+    await bot.refresh("t-1")
+    assert len(tg.to(ANNA)) == before
+
+    await bot.handle(tap(ADMIN, f"rv:{ANNA}"))  # twice: nothing more happens
+    assert len(tg.to(ANNA)) == before
+    await bot.handle(text(ANNA, NEW))  # as someone new: asked who they are, then a request
+    assert "Как вас зовут" in tg.to(ANNA)[-1]
+    await bot.handle(text(ANNA, "Анна, снова"))
+    assert (await store.sender(ANNA)).status == "pending"
+    assert "Анна, снова" in tg.to(ADMIN)[-1]
+
+    await bot.handle(tap(ADMIN, f"bl:{ANNA}"))
+    assert (await store.sender(ANNA)).status == "blocked"
+    await bot.handle(text(ANNA, "/start"))
+    assert len(tg.to(ANNA)) == before + 2, "a block is silent, and so is the bot after it"
+    await bot.handle(tap(ADMIN, f"who:{ANNA}"))
+    assert buttons(tg.last(ADMIN)) == [f"ub:{ANNA}"]
+    await bot.handle(tap(EVE, f"ub:{ANNA}"))  # not an approver
+    assert (await store.sender(ANNA)).status == "blocked"
+
+    await bot.handle(tap(ADMIN, f"ub:{ANNA}"))
+    assert (await store.sender(ANNA)).status == "revoked"
+    assert len(tg.to(ANNA)) == before + 2, "unblocking is not announced either"
+    await bot.handle(text(ANNA, "/start"))
+    assert "Как вас зовут" in tg.to(ANNA)[-1]
+    events = await store.db._all(
+        "SELECT detail FROM audit_log WHERE event = 'tickets_sender' ORDER BY id"
+    )
+    assert [e["detail"]["action"] for e in events] == [
+        "approve",
+        "revoke",
+        "block",
+        "unblock",
+    ]
+    assert events[0]["detail"]["approver_tg"] == ADMIN
+
+
+async def test_senders_lists_everyone_with_what_can_be_done(bot, store, tg, yg):
+    a = await approved(bot, store, tg)
+    await bot.handle(text(EVE, "/start"))
+    await bot.handle(text(EVE, "Ева"))
+    await bot.handle(text(ADMIN, "/senders"))
+    listing = tg.last(ADMIN)
+    assert buttons(listing) == [f"who:{EVE}", f"who:{ANNA}"], "who waits comes first"
+    assert "⏳ Ева — ждёт решения" in listing["reply_markup"]["inline_keyboard"][0][0]["text"]
+
+    await bot.handle(tap(ADMIN, f"who:{EVE}"))
+    assert buttons(tg.last(ADMIN)) == [
+        f"ok:{EVE}:{a}:p-other",
+        f"ok:{EVE}:{a}:p-client",
+        f"no:{EVE}",
+        f"bl:{EVE}",
+    ]
+    await bot.handle(tap(ADMIN, f"no:{ANNA}"))  # already approved: a stale button does nothing
+    assert (await store.sender(ANNA)).approved
+    await bot.handle(tap(ADMIN, f"ok:{ANNA}:{a}:p-other"))  # approving again is not a move
+    assert (await store.sender(ANNA)).project_id == "p-client"
+
+
+async def test_the_admin_pages_requests_are_carried_out_by_the_bot(bot, store, tg, yg):
+    a = await account(store)
+    await bot.handle(text(EVE, "/start"))
+    await bot.handle(text(EVE, "Ева"))
+    approve = await store.queue_action(EVE, "approve", account_id=a.id, project_id="p-client")
+    wrong = await store.queue_action(EVE, "reject")  # by then she is approved: refused
+    assert await store.action_result(approve) is None
+    assert await bot.run_actions() == 2
+    assert await store.action_result(approve) == (True, "✅ Одобрено, проект: Работы")
+    assert await store.action_result(wrong) == (False, "Запрос уже решён")
+    assert (await store.sender(EVE)).approved and "Доступ открыт" in tg.to(EVE)[-1]
+    assert await store.open_actions() == []
+
+    old = await store.queue_action(EVE, "block")
+    await store.db._exec(
+        "UPDATE ticket_actions SET created_at = now() - interval '2 days' WHERE id = %s", (old,)
+    )
+    await bot.run_actions()
+    assert (await store.action_result(old))[0] is False
+    assert (await store.sender(EVE)).approved, "a request left for days is not carried out"

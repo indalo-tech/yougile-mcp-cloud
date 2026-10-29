@@ -3,6 +3,7 @@ YouGile account and the webhook subscriptions."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 
@@ -18,7 +19,8 @@ TOKEN = "123456:" + "A" * 35
 
 @pytest.fixture
 def settings(settings):  # noqa: ANN001 - the conftest one, with the bot's company set
-    return dataclasses.replace(settings, tickets_company_id="c-main")
+    # Each view of the page asks YouGile a few things: a long test would wait on the limit.
+    return dataclasses.replace(settings, tickets_company_id="c-main", rate_limit=1000)
 
 
 @pytest.fixture
@@ -163,3 +165,81 @@ async def test_webhooks_are_made_with_the_admins_key(server, settings, http, fak
     assert page.text.count('<td data-label="Состояние">работает</td>') == 2
     assert "Проверить подписки" in page.text
     assert json.dumps(hook_url(settings))[1:-1] not in page.text, "the hook secret is not shown"
+
+
+async def test_people_are_managed_from_the_page(server, settings, http, fake, store, telegram):
+    from yougile_cloud.tickets import admin_page
+
+    fake.accounts["bot@example.com"] = {"password": "pw", "memberships": {"c-main": "u-bot"}}
+    fake.boards.append({"id": "b-req", "title": "Заявки", "projectId": "p2"})
+    fake.columns.append({"id": "k-req", "title": "Очередь", "boardId": "b-req"})
+    assert (await admin_login(http, settings)).status_code == 303
+    await post(
+        http, settings, "/admin/tickets/account", {"login": "bot@example.com", "password": "pw"}
+    )
+    account = await store.account_of_company("c-main")
+    await store.request_access(100, "Анна", "anna")
+    await store.request_access(200, "Ева", "")
+    await store.decide(200, "blocked", by=None)
+
+    page = await http.get("/admin/tickets")
+    assert f'<option value="{account.id}:p2">Клиенты</option>' in page.text
+    assert page.text.count('value="approve"') == 1 and page.text.count('value="reject"') == 1
+    assert page.text.count('value="unblock"') == 1 and page.text.count('value="block"') == 1
+
+    no_project = await post(
+        http, settings, "/admin/tickets/sender", {"tg_user_id": "100", "action": "approve"}
+    )
+    assert "Выберите проект" in no_project.text
+    stranger = await post(
+        http, settings, "/admin/tickets/sender", {"tg_user_id": "999", "action": "block"}
+    )
+    assert "Сотрудник не найден" in stranger.text
+    stale = await post(
+        http, settings, "/admin/tickets/sender", {"tg_user_id": "200", "action": "reject"}
+    )
+    assert "Ева: Запрос уже решён." in stale.text
+    assert await store.open_actions() == []
+
+    # The bot is not running: the request waits for it, and the page says so.
+    admin_page.ACTION_WAIT, wait = 0.0, admin_page.ACTION_WAIT
+    try:
+        queued = await post(
+            http,
+            settings,
+            "/admin/tickets/sender",
+            {"tg_user_id": "100", "action": "approve", "project": f"{account.id}:p2"},
+        )
+    finally:
+        admin_page.ACTION_WAIT = wait
+    assert queued.headers["location"].endswith("done=tickets_queued")
+    [request] = await store.open_actions()
+    assert (request.tg_user_id, request.action, request.account_id, request.project_id) == (
+        100,
+        "approve",
+        account.id,
+        "p2",
+    )
+    assert request.user_id is not None
+    page = await http.get("/admin/tickets")
+    assert "ждёт бота: одобрение" in page.text
+    await store.finish_action(request.id, True, "✅")
+
+    # The bot carries it out while the page waits: what it says is what the admin sees.
+    async def bot(ok: bool, line: str) -> None:
+        while not (actions := await store.open_actions()):
+            await asyncio.sleep(0.05)
+        await store.finish_action(actions[0].id, ok, line)
+
+    task = asyncio.create_task(bot(True, "🚫 Ева: заблокирован"))
+    done = await post(
+        http, settings, "/admin/tickets/sender", {"tg_user_id": "200", "action": "unblock"}
+    )
+    await task
+    assert done.headers["location"].endswith("done=tickets_sender")
+    task = asyncio.create_task(bot(False, "Не получилось"))
+    failed = await post(
+        http, settings, "/admin/tickets/sender", {"tg_user_id": "100", "action": "block"}
+    )
+    await task
+    assert failed.status_code == 200 and "Анна: Не получилось." in failed.text

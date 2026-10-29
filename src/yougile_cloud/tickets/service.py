@@ -35,6 +35,7 @@ RECONCILE_PAUSE = 2.0  # seconds between tickets in the periodic check
 CONCURRENT_UPDATES = 8  # Telegram updates handled at once (one person's stay in order)
 FIRST_CHECK = 60.0  # seconds after start: what a restart missed goes out within minutes
 DRAIN_SECONDS = 8.0  # on stop, updates being handled get this long (Docker waits 10 s)
+ACTIONS_SECONDS = 2.0  # how often the admin page's requests are looked for
 WEBHOOK_EVENTS = ("task-.*", "chat_message-created")
 
 
@@ -125,6 +126,7 @@ class TicketService:
             self._spawn(self._watch())
             self._spawn(self._reconcile())
             self._spawn(self._retry())
+            self._spawn(self._actions())
 
     async def config(self) -> tuple[str | None, frozenset[int]]:
         """The token and the approvers: the admin page's, else the environment's."""
@@ -199,6 +201,18 @@ class TicketService:
                 await self.apply_config()
             except Exception:
                 log.exception("re-reading the bot settings failed")
+
+    async def _actions(self) -> None:
+        """The admin page's requests about people (approve, revoke, block…): carried out here,
+        where the bot can tell the person."""
+        while True:
+            await asyncio.sleep(ACTIONS_SECONDS)
+            if self.bot is None:
+                continue
+            try:
+                await self.bot.run_actions()
+            except Exception:
+                log.exception("the admin page's requests failed")
 
     @staticmethod
     async def _poll(tg: Telegram, bot: TicketBot) -> None:

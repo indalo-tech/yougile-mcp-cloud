@@ -72,6 +72,8 @@ class FakeYouGile:
         self.deleted: list[str] = []
         self.calls: list[tuple[str, str]] = []
         self.webhooks: list[dict] = []
+        self.boards: list[dict] = []  # more boards (and their columns) than the one above
+        self.columns: list[dict] = []
 
     def _user(self, user: str) -> dict:
         return {
@@ -121,10 +123,11 @@ class FakeYouGile:
         ]
         lists = {
             "/projects": [{"id": "p1", "title": "Проект"}, {"id": "p2", "title": "Клиенты"}],
-            "/boards": [{"id": "b1", "title": "Доска", "projectId": "p1"}],
+            "/boards": [{"id": "b1", "title": "Доска", "projectId": "p1"}, *self.boards],
             "/columns": [
                 {"id": "k1", "title": "Очередь", "boardId": "b1"},
                 {"id": "k2", "title": "Готово", "boardId": "b1"},
+                *self.columns,
             ],
             "/users": [self._user(uid) for uid in members],
         }

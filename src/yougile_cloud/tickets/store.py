@@ -47,6 +47,19 @@ class Sender:
 
 
 @dataclass(frozen=True)
+class Action:
+    """An admin page's request to the bot about a person (table ticket_actions)."""
+
+    id: int
+    tg_user_id: int
+    action: str
+    account_id: int | None
+    project_id: str | None
+    user_id: int | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class Ticket:
     task_id: str
     account_id: int
@@ -176,8 +189,8 @@ class TicketStore:
             ON CONFLICT (tg_user_id) DO UPDATE SET
                 name = EXCLUDED.name, username = EXCLUDED.username,
                 tg_thread_id = EXCLUDED.tg_thread_id,
-                status = CASE WHEN ticket_senders.status = 'rejected' THEN 'pending'
-                              ELSE ticket_senders.status END
+                status = CASE WHEN ticket_senders.status IN ('rejected', 'revoked')
+                              THEN 'pending' ELSE ticket_senders.status END
             RETURNING *
             """,
             (tg_user_id, name, username, thread),
@@ -195,7 +208,7 @@ class TicketStore:
         project_id: str | None = None,
         project_name: str = "",
     ) -> Sender | None:
-        """Approve (binding the sender to a project), reject or block."""
+        """Approve (binding the sender to a project), reject, revoke, block or unblock."""
         row = await self.db._one(
             """
             UPDATE ticket_senders SET status = %s,
@@ -212,6 +225,55 @@ class TicketStore:
     async def senders(self) -> list[Sender]:
         rows = await self.db._all("SELECT * FROM ticket_senders ORDER BY created_at")
         return [_sender(r) for r in rows]
+
+    # ---------- the admin page's requests to the bot ----------
+
+    async def queue_action(
+        self,
+        tg_user_id: int,
+        action: str,
+        *,
+        account_id: int | None = None,
+        project_id: str | None = None,
+        user_id: int | None = None,
+    ) -> int:
+        row = await self.db._one(
+            """
+            INSERT INTO ticket_actions (tg_user_id, action, account_id, project_id, user_id)
+            VALUES (%s, %s, %s, %s, %s) RETURNING id
+            """,
+            (tg_user_id, action, account_id, project_id, user_id),
+        )
+        assert row is not None
+        return int(row["id"])
+
+    async def open_actions(self) -> list[Action]:
+        rows = await self.db._all(
+            "SELECT * FROM ticket_actions WHERE done_at IS NULL ORDER BY id LIMIT 50"
+        )
+        return [Action(**{k: r[k] for k in Action.__dataclass_fields__}) for r in rows]
+
+    async def finish_action(self, action_id: int, ok: bool, result: str) -> None:
+        await self.db._exec(
+            "UPDATE ticket_actions SET done_at = now(), ok = %s, result = %s WHERE id = %s",
+            (ok, result, action_id),
+        )
+
+    async def action_result(self, action_id: int) -> tuple[bool, str] | None:
+        """(ok, the bot's line) once done; None while it waits for the bot."""
+        row = await self.db._one(
+            "SELECT done_at, ok, result FROM ticket_actions WHERE id = %s", (action_id,)
+        )
+        if row is None or row["done_at"] is None:
+            return None
+        return bool(row["ok"]), row["result"]
+
+    async def waiting_actions(self) -> dict[int, str]:
+        """People with a request the bot has not carried out yet: their latest one."""
+        rows = await self.db._all(
+            "SELECT tg_user_id, action FROM ticket_actions WHERE done_at IS NULL ORDER BY id"
+        )
+        return {r["tg_user_id"]: r["action"] for r in rows}
 
     # ---------- tickets ----------
 

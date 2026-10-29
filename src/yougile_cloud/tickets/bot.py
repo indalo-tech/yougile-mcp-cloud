@@ -117,6 +117,36 @@ TOPIC_ADMIN_COMMANDS = [
     {"command": "id", "description": "Мой Telegram id"},
 ]
 NO_PROJECT = "Проект не найден или в нём больше нет доски «Заявки»"
+REVOKED = (
+    "Доступ к заявкам закрыт администратором. Если это ошибка — напишите сюда, как вас зовут и "
+    "из какой вы компании: запрос уйдёт снова."
+)
+# Approvers' buttons: their code, and what each does to a person.
+DECISIONS = {
+    "ok": "approve",
+    "no": "reject",
+    "mv": "move",
+    "rv": "revoke",
+    "bl": "block",
+    "ub": "unblock",
+}
+NEW_STATUS = {
+    "approve": "approved",
+    "reject": "rejected",
+    "move": "approved",
+    "revoke": "revoked",
+    "block": "blocked",
+    "unblock": "revoked",  # as after revoking: they may ask again, nothing more
+}
+ICON = {"pending": "⏳", "approved": "✅", "revoked": "⛔", "rejected": "❌", "blocked": "🚫"}
+STATUS_TEXT = {
+    "pending": "ждёт решения",
+    "approved": "одобрен",
+    "revoked": "доступ отозван",
+    "rejected": "отклонён",
+    "blocked": "заблокирован",
+}
+ACTION_TTL = 86_400  # seconds: an admin page request the bot did not get to by then is dropped
 DRAFT_BUTTONS = inline([[("✅ Отправить", "send"), ("✖️ Отменить", "cancel")]])
 
 
@@ -226,6 +256,33 @@ def draft_card(draft: dict) -> str:
         lines.append(f"📎 файлов: {files}")
     lines.append("\nДопишите сюда ещё, если нужно, и нажмите «Отправить».")
     return "\n".join(lines)
+
+
+def refused(action: str, sender: Sender) -> str | None:
+    """Why an action does not apply to the person as they are now (None: it does)."""
+    status = sender.status
+    if action == "approve" and sender.approved:
+        return f"Уже одобрен, проект: {sender.project_name}"
+    if action == "approve" and status == "blocked":
+        return "Заблокирован: сначала разблокируйте"
+    if action == "reject" and status != "pending":
+        return "Запрос уже решён"
+    if action in ("move", "revoke") and not sender.approved:
+        return "Доступа и так нет"
+    if action == "block" and status == "blocked":
+        return "Уже заблокирован"
+    if action == "unblock" and status != "blocked":
+        return "Не заблокирован"
+    if action not in NEW_STATUS:
+        return "Неизвестное действие"
+    return None
+
+
+def where(sender: Sender) -> str:
+    """A person's project, or their status when they have none."""
+    if sender.approved:
+        return sender.project_name
+    return STATUS_TEXT.get(sender.status, sender.status)
 
 
 def topic_name(number: str, title: str, mark: str = "") -> str:
@@ -773,12 +830,12 @@ class TicketBot:
         chat = (msg.get("chat") or {}).get("id", uid)
         answer: str | None = None
         try:
-            if data.startswith(("ok:", "no:")):
+            if data.startswith(("ok:", "no:", "mv:", "rv:", "bl:", "ub:")):
                 answer = await self.decide(uid, data, msg)
+            elif data.startswith("who:"):
+                answer = await self.sender_card(uid, chat, int(data.removeprefix("who:")))
             elif data.startswith("mvl:"):
                 answer = await self.offer_move(uid, chat, int(data.removeprefix("mvl:")))
-            elif data.startswith("mv:"):
-                answer = await self.move(uid, data, msg)
             else:
                 sender = await self.store.sender(uid)
                 if sender is None or not sender.approved:
@@ -801,48 +858,126 @@ class TicketBot:
                 log.info("answerCallbackQuery: %s", exc)
 
     async def decide(self, uid: int, data: str, msg: dict) -> str:
+        """An approver's button about a person: ``<code>:<tg id>[:<account id>:<project id>]``."""
         if uid not in self.admins:
             return "Только для администраторов"
-        parts = data.split(":")
-        target = int(parts[1])
-        if parts[0] == "ok":
-            account, project = await self.chosen(parts[2:])
-            if account is None or project is None:
-                return NO_PROJECT
-            sender = await self.store.decide(
-                target,
-                "approved",
-                by=uid,
-                account_id=account.id,
-                project_id=project.id,
-                project_name=project.title,
-            )
-            verdict = f"✅ Одобрено, проект: {project.title}"
-        else:
-            project = None
-            sender = await self.store.decide(target, "rejected", by=uid)
-            verdict = "❌ Отклонено"
-        if sender is None:
-            return "Запрос не найден"
-        held = (await self.store.draft(target)).get("held") or {}
-        await self.store.save_draft(target, {})  # the «request pending» note
+        code, target, *ref = data.split(":")
+        ok, verdict = await self.manage(int(target), DECISIONS[code], ref, by=uid)
+        if not ok:
+            return verdict
         await self.mark(msg, verdict)
-        if project:
-            help_text = await self.help_text()
-            waiting = (
-                "\n\nТо, что вы писали, пока ждали доступа, я отправил заявками — каждая в "
-                "своей теме."
-                if any(d.get("parts") or d.get("files") for d in held.values())
-                else ""
-            )
-            await self.tell(
-                target,
-                f"Доступ открыт — теперь можно оставлять заявки.{waiting}\n\n{help_text}",
-            )
-            await self.release_held(sender, held)
-        else:
-            await self.tell(target, "К сожалению, в доступе отказано.")
         return "Готово"
+
+    async def manage(
+        self,
+        target: int,
+        action: str,
+        ref: list[str] | None = None,
+        *,
+        by: int | None = None,
+        user_id: int | None = None,
+    ) -> tuple[bool, str]:
+        """What an approver decides about a person — from the bot's buttons (``by``, their
+        Telegram id) or the admin page (``user_id``, the admin there). ``ref`` is the
+        ``<account id>, <project id>`` of approve and move. Returns whether it was done and
+        one line about it for the approver."""
+        async with self._locks[f"access:{target}"]:
+            sender = await self.store.sender(target)
+            if sender is None:
+                return False, "Сотрудник не найден"
+            refusal = refused(action, sender)
+            if refusal:
+                return False, refusal
+            account = project = None
+            if action in ("approve", "move"):
+                account, project = await self.chosen(ref or [])
+                if account is None or project is None:
+                    return False, NO_PROJECT
+                if action == "move" and (account.id, project.id) == (
+                    sender.account_id,
+                    sender.project_id,
+                ):
+                    return False, f"Уже в проекте «{sender.project_name}»"
+            status = NEW_STATUS[action]
+            done = await self.store.decide(
+                target,
+                status,
+                by=by,
+                account_id=account.id if account else None,
+                project_id=project.id if project else None,
+                project_name=project.title if project else "",
+            )
+            assert done is not None
+            company = account.company_id if account else None
+            if company is None and sender.account_id:
+                previous = await self.store.account(sender.account_id)
+                company = previous.company_id if previous else None
+            await self.store.db.audit(
+                "tickets_sender",
+                company_id=company,
+                user_id=user_id,
+                action=action,
+                tg_user_id=target,
+                approver_tg=by,
+                project=project.title if project else None,
+            )
+            log.info("sender %s: %s (%s -> %s)", target, action, sender.status, status)
+
+            name = sender.name
+            if action == "approve":
+                assert project is not None
+                held = (await self.store.draft(target)).get("held") or {}
+                await self.store.save_draft(target, {})  # the «request pending» note
+                help_text = await self.help_text()
+                waiting = (
+                    "\n\nТо, что вы писали, пока ждали доступа, я отправил заявками — каждая в "
+                    "своей теме."
+                    if any(d.get("parts") or d.get("files") for d in held.values())
+                    else ""
+                )
+                await self.tell(
+                    target,
+                    f"Доступ открыт — теперь можно оставлять заявки.{waiting}\n\n{help_text}",
+                )
+                await self.release_held(done, held)
+                return True, f"✅ Одобрено, проект: {project.title}"
+            if action == "reject":
+                await self.store.save_draft(target, {})
+                await self.tell(target, "К сожалению, в доступе отказано.")
+                return True, "❌ Отклонено"
+            if action == "move":
+                assert project is not None
+                await self.store.drop_drafts(target)  # half-written tickets were for the old one
+                await self.tell(
+                    target,
+                    f"Теперь ваши заявки идут в проект «{esc(project.title)}». "
+                    "Уже отправленные остаются там, где были.",
+                )
+                return True, f"✅ {name}: {sender.project_name} → {project.title}"
+            await self.store.drop_drafts(target)  # nothing written from now on is a ticket
+            if action == "revoke":
+                await self.tell(target, REVOKED)
+                return True, f"⛔ {name}: доступ отозван"
+            if action == "block":  # said nothing: the bot simply stops answering
+                return True, f"🚫 {name}: заблокирован"
+            return True, f"↩️ {name}: разблокирован — может снова запросить доступ"
+
+    async def run_actions(self) -> int:
+        """Carry out what the admin page asked for (see ``ticket_actions``)."""
+        done = 0
+        for a in await self.store.open_actions():
+            if time.time() - a.created_at.timestamp() > ACTION_TTL:
+                await self.store.finish_action(a.id, False, "Не выполнено: бот долго не работал")
+                continue
+            ref = [str(a.account_id), a.project_id or ""] if a.account_id else []
+            try:
+                ok, result = await self.manage(a.tg_user_id, a.action, ref, user_id=a.user_id)
+            except Exception:
+                log.exception("admin page action %s failed", a.id)
+                ok, result = False, "Не получилось: ошибка в боте, подробности в журнале"
+            await self.store.finish_action(a.id, ok, result)
+            done += 1
+        return done
 
     async def chosen(self, ref: list[str]) -> tuple[Account | None, Project | None]:
         """The account and project of a button's ``<account id>:<project id>``."""
@@ -869,17 +1004,51 @@ class TicketBot:
             log.info("editMessageText: %s", exc)
 
     async def list_senders(self, chat: int) -> None:
-        senders = [s for s in await self.store.senders() if s.approved]
+        senders = await self.store.senders()
         if not senders:
-            await self.reply(chat, "Одобренных сотрудников пока нет.")
+            await self.reply(chat, "Доступ к заявкам пока никто не просил.")
             return
+        order = {"pending": 0, "approved": 1, "revoked": 2, "rejected": 3, "blocked": 4}
+        senders.sort(key=lambda s: (order.get(s.status, 5), s.name.lower()))
         rows = [
-            [(f"🔀 {clip(s.name, 40)} — {s.project_name}", f"mvl:{s.tg_user_id}")]
+            [(f"{ICON.get(s.status, '')} {clip(s.name, 40)} — {where(s)}", f"who:{s.tg_user_id}")]
             for s in senders[:90]  # Telegram allows 100 buttons per message
         ]
         await self.reply(
-            chat, "Сотрудники и их проекты. Нажмите, чтобы перевести в другой:", markup=inline(rows)
+            chat,
+            "Сотрудники в боте. Нажмите на человека — откроются действия: перевести в другой "
+            "проект, одобрить, отозвать доступ, заблокировать.\n"
+            "⏳ ждёт решения · ✅ одобрен · ⛔ доступ отозван · ❌ отклонён · 🚫 заблокирован",
+            markup=inline(rows),
         )
+
+    async def sender_card(self, uid: int, chat: int, target: int) -> str | None:
+        """One person and what can be done about them now."""
+        if uid not in self.admins:
+            return "Только для администраторов"
+        s = await self.store.sender(target)
+        if s is None:
+            return "Сотрудник не найден"
+        handle = f" @{esc(s.username)}" if s.username else ""
+        text = (
+            f"<b>{esc(s.name)}</b>{handle} (id <code>{s.tg_user_id}</code>)\n"
+            f"{ICON.get(s.status, '')} {STATUS_TEXT.get(s.status, s.status)}"
+            + (f", проект: {esc(s.project_name)}" if s.approved else "")
+        )
+        rows: list[list[tuple[str, str]]] = []
+        if s.approved:
+            rows.append([("🔀 Перевести в другой проект", f"mvl:{target}")])
+            rows.append([("⛔ Отозвать доступ", f"rv:{target}")])
+        elif s.status != "blocked":
+            rows += [[(f"✅ {label}", f"ok:{target}:{ref}")] for label, ref in await self.choices()]
+            if s.status == "pending":
+                rows.append([("❌ Отклонить", f"no:{target}")])
+        if s.status == "blocked":
+            rows.append([("↩️ Разблокировать", f"ub:{target}")])
+        else:
+            rows.append([("🚫 Заблокировать", f"bl:{target}")])
+        await self.reply(chat, text, markup=inline(rows))
+        return None
 
     async def offer_move(self, uid: int, chat: int, target: int) -> str | None:
         if uid not in self.admins:
@@ -902,34 +1071,6 @@ class TicketBot:
             markup=inline(rows),
         )
         return None
-
-    async def move(self, uid: int, data: str, msg: dict) -> str:
-        if uid not in self.admins:
-            return "Только для администраторов"
-        parts = data.split(":")
-        target = int(parts[1])
-        current = await self.store.sender(target)
-        if current is None or not current.approved:
-            return "Сотрудник не найден"
-        account, project = await self.chosen(parts[2:])
-        if account is None or project is None:
-            return NO_PROJECT
-        await self.store.decide(
-            target,
-            "approved",
-            by=uid,
-            account_id=account.id,
-            project_id=project.id,
-            project_name=project.title,
-        )
-        await self.store.drop_drafts(target)  # half-written tickets were for the old project
-        await self.mark(msg, f"✅ {current.name}: {current.project_name} → {project.title}")
-        await self.tell(
-            target,
-            f"Теперь ваши заявки идут в проект «{esc(project.title)}». "
-            "Уже отправленные остаются там, где были.",
-        )
-        return "Переведён"
 
     async def take_title(self, chat: int, uid: int, draft: dict, msg: dict, text: str) -> None:
         if not text or text.startswith("/"):
