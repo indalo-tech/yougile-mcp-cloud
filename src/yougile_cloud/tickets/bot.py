@@ -414,6 +414,7 @@ class TicketBot:
             return
         if text == "/senders" and uid in self.admins:
             await self.list_senders(chat)
+            await self.drop_command_topic(msg)
             return
         sender = await self.store.sender(uid)
         if sender is None or not sender.approved:
@@ -665,7 +666,7 @@ class TicketBot:
                 await self.store.set_admin_topic(admin, thread)
         return thread
 
-    async def to_admin(self, admin: int, text: str, markup: dict) -> None:
+    async def to_admin(self, admin: int, text: str, markup: dict | None = None) -> None:
         for attempt in (1, 2):
             thread = await self.admin_thread(admin)
             try:
@@ -834,9 +835,9 @@ class TicketBot:
             if data.startswith(("ok:", "no:", "mv:", "rv:", "bl:", "ub:")):
                 answer = await self.decide(uid, data, msg)
             elif data.startswith("who:"):
-                answer = await self.sender_card(uid, chat, int(data.removeprefix("who:")))
+                answer = await self.sender_card(uid, int(data.removeprefix("who:")))
             elif data.startswith("mvl:"):
-                answer = await self.offer_move(uid, chat, int(data.removeprefix("mvl:")))
+                answer = await self.offer_move(uid, int(data.removeprefix("mvl:")))
             else:
                 sender = await self.store.sender(uid)
                 if sender is None or not sender.approved:
@@ -1006,10 +1007,10 @@ class TicketBot:
         except TelegramError as exc:
             log.info("editMessageText: %s", exc)
 
-    async def list_senders(self, chat: int) -> None:
+    async def list_senders(self, admin: int) -> None:
         senders = await self.store.senders()
         if not senders:
-            await self.reply(chat, "Доступ к заявкам пока никто не просил.")
+            await self.to_admin(admin, "Доступ к заявкам пока никто не просил.")
             return
         order = {"pending": 0, "approved": 1, "revoked": 2, "rejected": 3, "blocked": 4}
         senders.sort(key=lambda s: (order.get(s.status, 5), s.name.lower()))
@@ -1017,15 +1018,30 @@ class TicketBot:
             [(f"{ICON.get(s.status, '')} {clip(s.name, 40)} — {where(s)}", f"who:{s.tg_user_id}")]
             for s in senders[:90]  # Telegram allows 100 buttons per message
         ]
-        await self.reply(
-            chat,
+        await self.to_admin(
+            admin,
             "Сотрудники в боте. Нажмите на человека — откроются действия: перевести в другой "
             "проект, одобрить, отозвать доступ, заблокировать.\n"
             "⏳ ждёт решения · ✅ одобрен · ⛔ доступ отозван · ❌ отклонён · 🚫 заблокирован",
-            markup=inline(rows),
+            inline(rows),
         )
 
-    async def sender_card(self, uid: int, chat: int, target: int) -> str | None:
+    async def drop_command_topic(self, msg: dict) -> None:
+        """A command sent from the menu with topics on makes a topic of its own, and Telegram
+        on Android covers a fresh topic's buttons with its «new topic» notice: the answer goes
+        to the approver's «access requests» topic, the command's topic is removed."""
+        thread = thread_of(msg)
+        if thread is None or "forum_topic_created" not in (msg.get("reply_to_message") or {}):
+            return
+        chat = msg["chat"]["id"]
+        if await self.store.ticket_of_thread(chat, thread):
+            return
+        try:
+            await self.tg.call("deleteForumTopic", chat_id=chat, message_thread_id=thread)
+        except TelegramError as exc:
+            log.info("deleteForumTopic: %s", exc)
+
+    async def sender_card(self, uid: int, target: int) -> str | None:
         """One person and what can be done about them now."""
         if uid not in self.admins:
             return "Только для администраторов"
@@ -1050,10 +1066,10 @@ class TicketBot:
             rows.append([("↩️ Разблокировать", f"ub:{target}")])
         else:
             rows.append([("🚫 Заблокировать", f"bl:{target}")])
-        await self.reply(chat, text, markup=inline(rows))
+        await self.to_admin(uid, text, inline(rows))
         return None
 
-    async def offer_move(self, uid: int, chat: int, target: int) -> str | None:
+    async def offer_move(self, uid: int, target: int) -> str | None:
         if uid not in self.admins:
             return "Только для администраторов"
         sender = await self.store.sender(target)
@@ -1067,11 +1083,11 @@ class TicketBot:
         if not choices:
             return "Других проектов с доской «Заявки» нет"
         rows = [[(f"➡️ {label}", f"mv:{target}:{ref}")] for label, ref in choices]
-        await self.reply(
-            chat,
+        await self.to_admin(
+            uid,
             f"Куда перевести <b>{esc(sender.name)}</b>? Сейчас: {esc(sender.project_name)}.\n"
             "Новые заявки пойдут в выбранный проект, отправленные останутся где были.",
-            markup=inline(rows),
+            inline(rows),
         )
         return None
 

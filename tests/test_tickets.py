@@ -1207,6 +1207,27 @@ async def test_senders_lists_everyone_with_what_can_be_done(bot, store, tg, yg):
     assert (await store.sender(ANNA)).project_id == "p-client"
 
 
+async def test_with_topics_the_senders_go_to_the_approvers_topic(bot, store, tg, yg):
+    tg.topics_on = True
+    await approved(bot, store, tg)
+    # /senders from the menu: Telegram makes a topic of it (its first message notes that).
+    made = {"message_id": 41, "forum_topic_created": {"name": "/senders"}}
+    await bot.handle(in_topic(ADMIN, 950, "/senders"))
+    command = in_topic(ADMIN, 951, "/senders")
+    command["message"]["reply_to_message"] = made
+    await bot.handle(command)
+    listing = tg.last(ADMIN)
+    thread = listing["message_thread_id"]
+    assert tg.topics[thread] == "🔑 Запросы доступа" and buttons(listing) == [f"who:{ANNA}"]
+    assert tg.deleted_topics == [951], "the command's own topic goes; one typed elsewhere stays"
+
+    await bot.handle(tap_in(ADMIN, f"who:{ANNA}", thread))
+    card = tg.last(ADMIN)
+    assert card["message_thread_id"] == thread and f"rv:{ANNA}" in buttons(card)
+    await bot.handle(tap(ADMIN, f"mvl:{ANNA}"))  # a bot-made topic's message comes without it
+    assert tg.last(ADMIN)["message_thread_id"] == thread
+
+
 async def test_the_admin_pages_requests_are_carried_out_by_the_bot(bot, store, tg, yg):
     a = await account(store)
     await bot.handle(text(EVE, "/start"))
