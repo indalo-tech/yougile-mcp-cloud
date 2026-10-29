@@ -19,8 +19,7 @@ TOKEN = "123456:" + "A" * 35
 
 @pytest.fixture
 def settings(settings):  # noqa: ANN001 - the conftest one, with the bot's company set
-    # Each view of the page asks YouGile a few things: a long test would wait on the limit.
-    return dataclasses.replace(settings, tickets_company_id="c-main", rate_limit=1000)
+    return dataclasses.replace(settings, tickets_company_id="c-main")
 
 
 @pytest.fixture
@@ -181,11 +180,22 @@ async def test_people_are_managed_from_the_page(server, settings, http, fake, st
     await store.request_access(100, "Анна", "anna")
     await store.request_access(200, "Ева", "")
     await store.decide(200, "blocked", by=None)
+    await store.request_access(300, "<img src=x onerror=alert(1)>", "")
+    await store.decide(300, "blocked", by=None)
 
     page = await http.get("/admin/tickets")
     assert f'<option value="{account.id}:p2">Клиенты</option>' in page.text
     assert page.text.count('value="approve"') == 1 and page.text.count('value="reject"') == 1
-    assert page.text.count('value="unblock"') == 1 and page.text.count('value="block"') == 1
+    assert page.text.count('value="unblock"') == 2 and page.text.count('value="block"') == 1
+    assert "<img src=x" not in page.text
+    calls = len(fake.calls)
+    named = await post(
+        http, settings, "/admin/tickets/sender", {"tg_user_id": "300", "action": "block"}
+    )
+    assert "Уже заблокирован" in named.text and "<img src=x" not in named.text
+    # Clicks re-render the page from what YouGile said a moment ago: per request, only the
+    # check that the admin is still one.
+    assert set(fake.calls[calls:]) == {("GET", "/users/me")}
 
     no_project = await post(
         http, settings, "/admin/tickets/sender", {"tg_user_id": "100", "action": "approve"}

@@ -1153,16 +1153,16 @@ async def test_revoke_block_and_unblock(bot, store, tg, yg):
 
     await bot.handle(tap(ADMIN, f"rv:{ANNA}"))  # twice: nothing more happens
     assert len(tg.to(ANNA)) == before
-    await bot.handle(text(ANNA, NEW))  # as someone new: asked who they are, then a request
-    assert "Как вас зовут" in tg.to(ANNA)[-1]
+    # Told to write who they are: the next message is that, and the request goes again.
     await bot.handle(text(ANNA, "Анна, снова"))
     assert (await store.sender(ANNA)).status == "pending"
     assert "Анна, снова" in tg.to(ADMIN)[-1]
+    assert "Запрос на доступ отправлен" in tg.to(ANNA)[-1]
 
     await bot.handle(tap(ADMIN, f"bl:{ANNA}"))
     assert (await store.sender(ANNA)).status == "blocked"
     await bot.handle(text(ANNA, "/start"))
-    assert len(tg.to(ANNA)) == before + 2, "a block is silent, and so is the bot after it"
+    assert len(tg.to(ANNA)) == before + 1, "a block is silent, and so is the bot after it"
     await bot.handle(tap(ADMIN, f"who:{ANNA}"))
     assert buttons(tg.last(ADMIN)) == [f"ub:{ANNA}"]
     await bot.handle(tap(EVE, f"ub:{ANNA}"))  # not an approver
@@ -1170,7 +1170,7 @@ async def test_revoke_block_and_unblock(bot, store, tg, yg):
 
     await bot.handle(tap(ADMIN, f"ub:{ANNA}"))
     assert (await store.sender(ANNA)).status == "revoked"
-    assert len(tg.to(ANNA)) == before + 2, "unblocking is not announced either"
+    assert len(tg.to(ANNA)) == before + 1, "unblocking is not announced either"
     await bot.handle(text(ANNA, "/start"))
     assert "Как вас зовут" in tg.to(ANNA)[-1]
     events = await store.db._all(

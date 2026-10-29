@@ -33,7 +33,7 @@ COMMANDS = [
 ]
 ADMIN_COMMANDS = [
     *COMMANDS,
-    {"command": "senders", "description": "Сотрудники и их проекты"},
+    {"command": "senders", "description": "Сотрудники: доступ и проекты"},
     {"command": "id", "description": "Мой Telegram id"},
 ]
 NO_MENU = {"remove_keyboard": True}
@@ -113,7 +113,7 @@ TOPIC_COMMANDS = [
 ]
 TOPIC_ADMIN_COMMANDS = [
     *TOPIC_COMMANDS,
-    {"command": "senders", "description": "Сотрудники и их проекты"},
+    {"command": "senders", "description": "Сотрудники: доступ и проекты"},
     {"command": "id", "description": "Мой Telegram id"},
 ]
 NO_PROJECT = "Проект не найден или в нём больше нет доски «Заявки»"
@@ -810,7 +810,8 @@ class TicketBot:
             f"Запрос доступа к заявкам:\n<b>{who}</b>\n"
             f"Telegram: {tg_name}{handle} (id <code>{sender.tg_user_id}</code>)\n\n"
             "В какой проект пойдут его (её) заявки? Они попадут на доску «Заявки» проекта.\n"
-            "Перевести потом в другой проект — /senders."
+            "Перевести потом в другой проект, отозвать доступ, заблокировать — /senders или "
+            "страница бота в админке."
         )
         choices = await self.choices()
         if not choices:
@@ -956,6 +957,8 @@ class TicketBot:
                 return True, f"✅ {name}: {sender.project_name} → {project.title}"
             await self.store.drop_drafts(target)  # nothing written from now on is a ticket
             if action == "revoke":
+                # Told to introduce themselves: their next message is that, not a greeting.
+                await self.store.save_draft(target, {"step": "intro"})
                 await self.tell(target, REVOKED)
                 return True, f"⛔ {name}: доступ отозван"
             if action == "block":  # said nothing: the bot simply stops answering

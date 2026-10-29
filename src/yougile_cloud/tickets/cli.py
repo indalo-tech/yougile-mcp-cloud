@@ -121,8 +121,16 @@ def cmd_senders(_args: argparse.Namespace) -> None:
 
 def cmd_block(args: argparse.Namespace) -> None:
     async def run(_settings: Settings, store: TicketStore) -> None:
+        # As the bot's 🚫 does (it tells nobody), without needing the bot to be running.
         sender = await store.decide(args.tg_user_id, "blocked", by=None)
-        print("заблокирован" if sender else "нет такого отправителя")
+        if sender is None:
+            print("нет такого отправителя")
+            return
+        await store.drop_drafts(args.tg_user_id)
+        await store.db.audit(
+            "tickets_sender", action="block", tg_user_id=args.tg_user_id, via="cli"
+        )
+        print("заблокирован")
 
     _run(run)
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -49,6 +50,11 @@ WAITING = {
     "unblock": "разблокировку",
 }
 ACTION_WAIT = 6.0  # seconds the page waits for the bot to carry out a request
+# What the page reads from YouGile (the bot account, its projects, the subscriptions) is kept
+# this long: managing people re-renders the page on every click, and YouGile's limit per
+# company (shared with MCP users and the bot) would run out after a handful of them.
+YOUGILE_TTL = 60.0
+YOUGILE_FIELDS = ("bot_name", "bot_is_admin", "visible", "requests", "choices", "hooks")
 
 
 @dataclass
@@ -88,6 +94,7 @@ class TicketAdmin:
     def __init__(self, pages: AdminPages) -> None:
         self.pages = pages
         self.tg_transport: Any = None  # tests: a fake Telegram
+        self._yougile: dict[str, tuple[float, tuple, dict[str, Any]]] = {}  # company: seen
 
     def _telegram(self, token: str) -> Telegram:
         return Telegram(token, transport=self.tg_transport)
@@ -147,6 +154,25 @@ class TicketAdmin:
                 st.telegram_error = str(exc)
 
         st.account = await store.account_of_company(ctx.session.company.id)
+        await self._from_yougile(ctx, st)
+        st.senders = [
+            s
+            for s in await store.senders()
+            if s.account_id in (None, st.account.id if st.account else None)
+        ]
+        st.waiting = await store.waiting_actions()
+        return st
+
+    async def _from_yougile(self, ctx: Ctx, st: Status) -> None:
+        """The bot account, the projects taking tickets and the webhook subscriptions: from
+        YouGile, or from what was read in the last YOUGILE_TTL seconds (errors are not kept)."""
+        company = ctx.session.company.id
+        key = (st.account.id, st.account.api_key_enc) if st.account else ()
+        seen = self._yougile.get(company)
+        if seen and seen[1] == key and time.monotonic() - seen[0] < YOUGILE_TTL:
+            for name, value in seen[2].items():
+                setattr(st, name, value)
+            return
         if st.account:
             desks = self._desks()
             try:
@@ -177,14 +203,11 @@ class TicketAdmin:
             st.hooks = [h for h in hooks if h.get("url") == url and not h.get("deleted")]
         except YouGileError as exc:
             st.hooks_error = str(exc)
-
-        st.senders = [
-            s
-            for s in await store.senders()
-            if s.account_id in (None, st.account.id if st.account else None)
-        ]
-        st.waiting = await store.waiting_actions()
-        return st
+        if st.account_error or st.hooks_error:
+            self._yougile.pop(company, None)
+        else:
+            fields = {name: getattr(st, name) for name in YOUGILE_FIELDS}
+            self._yougile[company] = (time.monotonic(), key, fields)
 
     # ---------- handlers ----------
 
@@ -295,6 +318,7 @@ class TicketAdmin:
                     old = None
                 if old and old != key:
                     await auth.delete_key(old)
+            self._yougile.pop(company.id, None)
             await self.pages.db.audit(
                 "tickets_account",
                 company_id=company.id,
@@ -309,6 +333,7 @@ class TicketAdmin:
         async def handler(_request: Request, ctx: Ctx) -> Response:
             if not self._owner(ctx):
                 return Response(status_code=404)
+            self._yougile.pop(ctx.session.company.id, None)  # what is subscribed now, shown
             try:
                 await _subscribe(ctx.client, hook_url(self.pages.settings))
             except YouGileError as exc:
