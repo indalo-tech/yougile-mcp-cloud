@@ -4,8 +4,10 @@ subscriptions — next to a status of each. Only admins of TICKETS_COMPANY_ID se
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -19,6 +21,7 @@ from .. import admin_pages as ui
 from ..pages import e
 from ..signin import TooManyAttempts
 from ..yougile_auth import BadCredentials, KeyLimitReached
+from .bot import NEW_STATUS, refused
 from .cli import _subscribe
 from .desk import Desks
 from .service import WEBHOOK_EVENTS, hook_url
@@ -35,8 +38,23 @@ STATUS = {
     "pending": "ждёт решения",
     "approved": "одобрен",
     "rejected": "отклонён",
+    "revoked": "доступ отозван",
     "blocked": "заблокирован",
 }
+WAITING = {
+    "approve": "одобрение",
+    "reject": "отказ",
+    "move": "перевод",
+    "revoke": "отзыв доступа",
+    "block": "блокировку",
+    "unblock": "разблокировку",
+}
+ACTION_WAIT = 6.0  # seconds the page waits for the bot to carry out a request
+# What the page reads from YouGile (the bot account, its projects, the subscriptions) is kept
+# this long: managing people re-renders the page on every click, and YouGile's limit per
+# company (shared with MCP users and the bot) would run out after a handful of them.
+YOUGILE_TTL = 60.0
+YOUGILE_FIELDS = ("bot_name", "bot_is_admin", "visible", "requests", "choices", "hooks")
 
 
 @dataclass
@@ -55,6 +73,8 @@ class Status:
     hooks: list[dict] = field(default_factory=list)  # subscriptions to this server's URL
     hooks_error: str | None = None
     senders: list[Sender] = field(default_factory=list)
+    choices: list[tuple[str, str]] = field(default_factory=list)  # ("<account>:<project>", title)
+    waiting: dict[int, str] = field(default_factory=dict)  # person: a request the bot has yet to do
 
     @property
     def missing_hooks(self) -> list[str]:
@@ -74,6 +94,7 @@ class TicketAdmin:
     def __init__(self, pages: AdminPages) -> None:
         self.pages = pages
         self.tg_transport: Any = None  # tests: a fake Telegram
+        self._yougile: dict[str, tuple[float, tuple, dict[str, Any]]] = {}  # company: seen
 
     def _telegram(self, token: str) -> Telegram:
         return Telegram(token, transport=self.tg_transport)
@@ -84,6 +105,7 @@ class TicketAdmin:
             ("/admin/tickets/telegram", "POST", self.save_telegram),
             ("/admin/tickets/account", "POST", self.save_account),
             ("/admin/tickets/webhooks", "POST", self.subscribe),
+            ("/admin/tickets/sender", "POST", self.manage_sender),
         ]
 
     # ---------- plumbing ----------
@@ -132,6 +154,25 @@ class TicketAdmin:
                 st.telegram_error = str(exc)
 
         st.account = await store.account_of_company(ctx.session.company.id)
+        await self._from_yougile(ctx, st)
+        st.senders = [
+            s
+            for s in await store.senders()
+            if s.account_id in (None, st.account.id if st.account else None)
+        ]
+        st.waiting = await store.waiting_actions()
+        return st
+
+    async def _from_yougile(self, ctx: Ctx, st: Status) -> None:
+        """The bot account, the projects taking tickets and the webhook subscriptions: from
+        YouGile, or from what was read in the last YOUGILE_TTL seconds (errors are not kept)."""
+        company = ctx.session.company.id
+        key = (st.account.id, st.account.api_key_enc) if st.account else ()
+        seen = self._yougile.get(company)
+        if seen and seen[1] == key and time.monotonic() - seen[0] < YOUGILE_TTL:
+            for name, value in seen[2].items():
+                setattr(st, name, value)
+            return
         if st.account:
             desks = self._desks()
             try:
@@ -144,7 +185,12 @@ class TicketAdmin:
                     for p in await fetch_all(desk.client, "/projects")
                     if not p.get("deleted")
                 )
-                st.requests = sorted(p.title for p in (await desk.projects(fresh=True)).values())
+                requests = (await desk.projects(fresh=True)).values()
+                st.requests = sorted(p.title for p in requests)
+                st.choices = sorted(
+                    ((f"{st.account.id}:{p.id}", p.title) for p in requests),
+                    key=lambda c: c[1].lower(),
+                )
             except (YouGileError, ValueError) as exc:
                 st.account_error = str(exc)
             finally:
@@ -157,13 +203,11 @@ class TicketAdmin:
             st.hooks = [h for h in hooks if h.get("url") == url and not h.get("deleted")]
         except YouGileError as exc:
             st.hooks_error = str(exc)
-
-        st.senders = [
-            s
-            for s in await store.senders()
-            if s.account_id in (None, st.account.id if st.account else None)
-        ]
-        return st
+        if st.account_error or st.hooks_error:
+            self._yougile.pop(company, None)
+        else:
+            fields = {name: getattr(st, name) for name in YOUGILE_FIELDS}
+            self._yougile[company] = (time.monotonic(), key, fields)
 
     # ---------- handlers ----------
 
@@ -274,6 +318,7 @@ class TicketAdmin:
                     old = None
                 if old and old != key:
                     await auth.delete_key(old)
+            self._yougile.pop(company.id, None)
             await self.pages.db.audit(
                 "tickets_account",
                 company_id=company.id,
@@ -288,6 +333,7 @@ class TicketAdmin:
         async def handler(_request: Request, ctx: Ctx) -> Response:
             if not self._owner(ctx):
                 return Response(status_code=404)
+            self._yougile.pop(ctx.session.company.id, None)  # what is subscribed now, shown
             try:
                 await _subscribe(ctx.client, hook_url(self.pages.settings))
             except YouGileError as exc:
@@ -298,6 +344,58 @@ class TicketAdmin:
             return ui_redirect("tickets_hooks")
 
         return await self.pages._guarded(request, handler, post=True)
+
+    async def manage_sender(self, request: Request) -> Response:
+        """Approve, reject, move, revoke, block or unblock a person: asked of the bot's process
+        (it tells the person and makes tickets of what they wrote while waiting); the page
+        waits a few seconds for the result."""
+
+        async def handler(_request: Request, ctx: Ctx) -> Response:
+            if not self._owner(ctx):
+                return Response(status_code=404)
+            form = ctx.form
+            assert form is not None
+            store = self.store
+            raw = str(form.get("tg_user_id", ""))
+            action = str(form.get("action", ""))
+            account = await store.account_of_company(ctx.session.company.id)
+            sender = await store.sender(int(raw)) if raw.isdigit() and len(raw) <= 20 else None
+            if sender is None or sender.account_id not in (None, account.id if account else None):
+                return await self._page(ctx, errors=["Сотрудник не найден."])
+            if action not in NEW_STATUS:
+                return await self._page(ctx, errors=["Неизвестное действие."])
+            if why := refused(action, sender):
+                return await self._page(ctx, errors=[f"{sender.name}: {why}."])
+            project_id = None
+            if action in ("approve", "move"):
+                acc, _, project_id = str(form.get("project", "")).partition(":")
+                if account is None or acc != str(account.id) or not project_id:
+                    return await self._page(ctx, errors=["Выберите проект с доской «Заявки»."])
+            action_id = await store.queue_action(
+                sender.tg_user_id,
+                action,
+                account_id=account.id if project_id and account else None,
+                project_id=project_id,
+                user_id=ctx.session.user.id,
+            )
+            result = await self._wait(action_id)
+            if result is None:
+                return ui_redirect("tickets_queued")
+            ok, line = result
+            if not ok:
+                return await self._page(ctx, errors=[f"{sender.name}: {line}."])
+            return ui_redirect("tickets_sender")
+
+        return await self.pages._guarded(request, handler, post=True)
+
+    async def _wait(self, action_id: int) -> tuple[bool, str] | None:
+        loop = asyncio.get_running_loop()
+        until = loop.time() + ACTION_WAIT
+        while True:
+            result = await self.store.action_result(action_id)
+            if result is not None or loop.time() >= until:
+                return result
+            await asyncio.sleep(0.3)
 
 
 def ui_redirect(done: str) -> Response:
@@ -320,6 +418,44 @@ def _when(seconds: Any, frame: ui.Frame) -> str:
         value /= 1000
     moment = datetime.fromtimestamp(value, UTC).astimezone(frame.tz)
     return f"{moment:%d.%m.%Y %H:%M}"
+
+
+def _sender_actions(s: Sender, st: Status, csrf: str) -> str:
+    """The buttons of a person's row: what can be done about them now."""
+    if s.tg_user_id in st.waiting:
+        return f'<span class="muted">ждёт бота: {e(WAITING.get(st.waiting[s.tg_user_id]))}</span>'
+
+    def form(action: str, label: str, style: str = "secondary", select: str = "") -> str:
+        return (
+            f'<form method="post" action="/admin/tickets/sender">{csrf}'
+            f'<input type="hidden" name="tg_user_id" value="{s.tg_user_id}">'
+            f'<input type="hidden" name="action" value="{action}">{select}'
+            f'<button class="inline {style}" type="submit">{label}</button></form>'
+        )
+
+    def projects(skip: str = "") -> str:
+        options = "".join(
+            f'<option value="{e(ref)}">{e(title)}</option>'
+            for ref, title in st.choices
+            if ref != skip
+        )
+        return f'<select name="project" aria-label="Проект">{options}</select>' if options else ""
+
+    parts: list[str] = []
+    if s.approved:
+        if other := projects(f"{s.account_id}:{s.project_id}"):
+            parts.append(form("move", "Перевести", select=other))
+        parts.append(form("revoke", "Отозвать доступ", "danger"))
+    elif s.status != "blocked":
+        if choices := projects():
+            parts.append(form("approve", "Одобрить", "", choices))
+        if s.status == "pending":
+            parts.append(form("reject", "Отклонить"))
+    if s.status == "blocked":
+        parts.append(form("unblock", "Разблокировать"))
+    else:
+        parts.append(form("block", "Заблокировать", "danger"))
+    return f'<div class="actions">{"".join(parts)}</div>'
 
 
 def tickets_page(
@@ -363,8 +499,8 @@ def tickets_page(
         f'<input type="text" id="admins" name="admins" value="{e(admins)}" '
         'placeholder="123456789, 987654321" autocomplete="off">'
         '<p class="hint">Свой id пришлёт бот в ответ на команду /id. Этим людям приходят '
-        "запросы доступа с кнопками проектов; у них работает /senders — перевод сотрудника в "
-        "другой проект.</p>"
+        "запросы доступа с кнопками проектов; у них работает /senders — сотрудники с теми же "
+        "действиями, что внизу этой страницы.</p>"
         '<button class="inline" type="submit">Сохранить</button></form>'
     )
 
@@ -440,21 +576,24 @@ def tickets_page(
     if st.senders:
         rows = "".join(
             f'<tr><td data-label="Сотрудник">{e(s.name)}'
-            f"{f' <span class=muted>@{e(s.username)}</span>' if s.username else ''}</td>"
+            f"{f' <span class=muted>@{e(s.username)}</span>' if s.username else ''}"
+            f'<br><span class="muted">id {s.tg_user_id}</span></td>'
             f'<td data-label="Статус">{e(STATUS.get(s.status, s.status))}</td>'
-            f'<td data-label="Проект">{e(s.project_name or "—")}</td>'
-            f'<td data-label="Telegram id"><span class="muted">{s.tg_user_id}</span></td></tr>'
+            f'<td data-label="Проект">{e(s.project_name if s.approved else "—")}</td>'
+            f'<td data-label="Действия">{_sender_actions(s, st, csrf)}</td></tr>'
             for s in st.senders
         )
         senders = (
             "<h2>Сотрудники в боте</h2><table><thead><tr><th>Сотрудник</th><th>Статус</th>"
-            f"<th>Проект</th><th>Telegram id</th></tr></thead><tbody>{rows}</tbody></table>"
+            f"<th>Проект</th><th>Действия</th></tr></thead><tbody>{rows}</tbody></table>"
         )
     else:
         senders = "<h2>Сотрудники в боте</h2><p>Пока никто не просил доступ.</p>"
     senders += (
-        '<p class="hint">Одобрять и переводить в другой проект — в самом боте: запросы '
-        "приходят одобряющим, команда /senders показывает список с кнопками.</p>"
+        '<p class="hint">Запросы доступа приходят одобряющим в бот; решать их и управлять '
+        "сотрудниками можно и здесь, и в боте командой /senders. Об одобрении, отказе, переводе "
+        "и отзыве доступа бот пишет сотруднику сам; заблокированному бот просто перестаёт "
+        "отвечать. После отзыва или разблокировки человек может запросить доступ заново.</p>"
     )
 
     body = (

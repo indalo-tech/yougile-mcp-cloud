@@ -48,7 +48,8 @@ border:1px solid var(--line);color:var(--muted)}
 button.secondary{background:var(--bg);color:var(--text);border:1px solid var(--line)}
 button.danger{background:var(--error-bg);color:var(--error)}
 .actions{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px}
-.actions form{margin:0}
+.actions form{margin:0;display:flex;gap:8px;align-items:center}
+.actions select{width:auto;margin-top:12px;padding:7px 10px}
 textarea.prose{font-family:inherit;font-size:15px}p.foot{text-align:center;margin-top:20px}
 code.url{display:block;padding:10px 12px;border:1px solid var(--line);border-radius:8px;
 background:var(--bg);font-size:15px;user-select:all;overflow-wrap:anywhere}ol{padding-left:20px}
